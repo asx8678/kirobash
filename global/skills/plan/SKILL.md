@@ -18,7 +18,7 @@ A plan is worth what its weakest assumption is worth. Find the assumptions, have
    ```json
    {"task": "Check the assumptions behind the plan to <goal>",
     "stages": [
-     {"name": "facts", "role": "fact-check", "prompt_template": "Verify for the versions this repo pins, each with the copied row or sentence and its link:\n1. <world assumption> (<product> <version>, pinned at <path:line>)\n2. ..."},
+     {"name": "facts", "role": "fact-check", "prompt_template": "Verify for the versions this repo pins, each with the copied row or sentence and its link:\n1. <world assumption> (<product> <version>, as pinned)\n2. ..."},
      {"name": "usage", "role": "scout", "prompt_template": "<one repo question, with the folders to look in>"},
      {"name": "doubts", "role": "skeptic", "depends_on": ["facts", "usage"],
       "prompt_template": "Request (the user's words): <quote>\nConstraints: <the list>\nApproach: <chosen> over <alternative>: <reason>\nPlan: <the draft, step by step>\nAssumptions: <the list>\nEvidence so far: <path:line facts from step 1>"}]}

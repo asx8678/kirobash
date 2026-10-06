@@ -35,7 +35,7 @@ ALLOWED_SURVIVORS = {
         "unreachable: dead code after `return None` at the end of analyze_env_leak",
 }
 
-DECIDING = {"read_tool_secrets", "command_reads_secrets"}     # a message sends the read to the masked path
+DECIDING = {"read_tool_secrets", "command_reads_secrets", "web_leak"}   # a message sends the read to the masked path, or refuses a web call
 
 
 # ------------------------------------------------------------------ mutants ---
