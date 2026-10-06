@@ -1,0 +1,12 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "session-context",
+      "description": "At session start, prints the active kube context, Azure subscription, AWS identity, guard mode and git branch into context (read-only, no credits).",
+      "trigger": "SessionStart",
+      "action": { "type": "command", "command": "bash ~/.kiro/hooks/scripts/session-context.sh" },
+      "timeout": 20
+    }
+  ]
+}

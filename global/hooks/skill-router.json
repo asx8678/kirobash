@@ -1,0 +1,12 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "skill-router",
+      "description": "When a prompt asks for a review, appends the code-review skill to it (once per session, one line after that), so the agent starts with the method instead of spending a turn loading it. Prints nothing for other prompts (no tokens).",
+      "trigger": "UserPromptSubmit",
+      "action": { "type": "command", "command": "bash ~/.kiro/hooks/scripts/skill-router.sh" },
+      "timeout": 5
+    }
+  ]
+}

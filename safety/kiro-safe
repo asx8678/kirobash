@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# kiro-safe: start Kiro CLI v3 with read-only cloud credentials.
+#   kiro-safe [kiro-cli args...]
+# For every cloud CLI installed on this machine (kubectl, az, aws) it requires the matching
+# read-only profile from the setup scripts, points Kiro at it, and removes any admin credentials
+# from the environment. Pass --allow-admin-creds to start anyway (guard + permissions still apply).
+set -euo pipefail
+
+ro_kube="${KIRO_KUBECONFIG:-$HOME/.kube/kiro-readonly.yaml}"
+ro_az="${KIRO_AZURE_CONFIG_DIR:-$HOME/.azure-kiro}"
+ro_aws="${KIRO_AWS_DIR:-$HOME/.aws-kiro}"
+allow_admin=0; args=()
+for a in "$@"; do
+  if [ "$a" = "--allow-admin-creds" ]; then allow_admin=1; else args+=("$a"); fi
+done
+have() { command -v "$1" >/dev/null 2>&1; }
+
+missing=(); using=()
+if have kubectl; then
+  if [ -f "$ro_kube" ]; then export KUBECONFIG="$ro_kube"; using+=("KUBECONFIG=$ro_kube")
+  else missing+=("Kubernetes (safety/make-readonly-kubeconfig.sh)"); fi
+fi
+if have az; then
+  if [ -d "$ro_az" ] && [ -n "$(ls -A "$ro_az" 2>/dev/null)" ]; then
+    export AZURE_CONFIG_DIR="$ro_az"; using+=("AZURE_CONFIG_DIR=$ro_az")
+    unset AZURE_CLIENT_SECRET AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_CLIENT_CERTIFICATE_PATH AZURE_USERNAME AZURE_PASSWORD
+  else missing+=("Azure (safety/setup-azure-readonly.sh)"); fi
+fi
+if have aws; then
+  if [ -s "$ro_aws/config" ]; then
+    export AWS_CONFIG_FILE="$ro_aws/config" AWS_SHARED_CREDENTIALS_FILE="$ro_aws/credentials"
+    unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+          AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_CONTAINER_CREDENTIALS_FULL_URI
+    using+=("AWS_CONFIG_FILE=$ro_aws/config")
+  else missing+=("AWS (safety/setup-aws-readonly.sh)"); fi
+fi
+
+if [ ${#missing[@]} -gt 0 ] && [ "$allow_admin" -ne 1 ]; then
+  printf 'kiro-safe: no read-only credentials for: %s\n' "${missing[*]}" >&2
+  echo "kiro-safe: set them up, or pass --allow-admin-creds to start with your normal credentials." >&2
+  exit 1
+fi
+[ ${#using[@]} -gt 0 ] && echo "kiro-safe: ${using[*]}" >&2
+[ ${#missing[@]} -gt 0 ] && echo "kiro-safe: WARNING admin credentials in use for: ${missing[*]}" >&2
+exec kiro-cli --v3 ${args[@]+"${args[@]}"}

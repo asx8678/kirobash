@@ -1,0 +1,14 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "validate-on-save",
+      "description": "DISABLED: Kiro CLI 2.26 (v3 engine) discards the output of PostFileSave command hooks, so the agent never sees the findings. Steering tells the agent to run the check itself. Re-enable only after confirming your Kiro version forwards the output.",
+      "trigger": "PostFileSave",
+      "matcher": "(\\.(tf|tfvars|bicep|sh|bash|ya?ml|json|py)$|Dockerfile)",
+      "action": { "type": "command", "command": "bash ~/.kiro/hooks/scripts/validate-on-save.sh" },
+      "timeout": 30,
+      "enabled": false
+    }
+  ]
+}

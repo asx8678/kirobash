@@ -1,0 +1,74 @@
+# Global Kiro ignore — install as ~/.kiro/settings/kiroignore
+# Keeps secrets out and stops the agent wasting credits on huge/generated files.
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.env
+!example.env
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+*kubeconfig*
+.aws/
+.ssh/
+*.tfvars.secret
+secrets/
+
+# Terraform state & caches (large, sensitive, never useful to read)
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfplan
+crash.log
+
+# Dependencies / build output
+node_modules/
+vendor/
+.venv/
+venv/
+__pycache__/
+dist/
+build/
+target/
+.cache/
+
+# Lock files & generated bulk
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+poetry.lock
+*.min.js
+*.min.css
+*.map
+
+# Large data / binaries / archives
+*.log
+*.sql
+*.dump
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.iso
+*.qcow2
+
+# Azure-specific secrets
+.azure/
+.azure-kiro/
+local.settings.json
+*.publishsettings
+*.PublishSettings
+azureProfile.json
+accessTokens.json
+msal_token_cache*
+service_principal_entries*
+
+# AWS-specific secrets
+.aws/
+.aws-kiro/
+*accessKeys*.csv
+*_accessKeys.csv

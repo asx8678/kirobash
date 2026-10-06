@@ -1,0 +1,32 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KiroNoSecretsOrDecrypt",
+      "Effect": "Deny",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "kms:Decrypt",
+        "kms:GenerateDataKey*",
+        "iam:CreateAccessKey",
+        "iam:CreateLoginProfile",
+        "sts:AssumeRole",
+        "ec2:GetPasswordData",
+        "rds:DownloadDBLogFilePortion",
+        "lambda:GetFunction",
+        "cloudformation:GetTemplate",
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KiroNoObjectReads",
+      "Effect": "Deny",
+      "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+      "Resource": "*"
+    }
+  ]
+}

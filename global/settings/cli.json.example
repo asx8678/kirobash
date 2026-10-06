@@ -1,0 +1,13 @@
+{
+  "chat.agentEngine": "v3",
+  "chat.modelDefaults": {
+    "claude-opus-5": {
+      "output_config": { "effort": "medium" },
+      "thinking": { "type": "adaptive", "display": "omitted" }
+    },
+    "claude-sonnet-5": {
+      "output_config": { "effort": "medium" },
+      "thinking": { "type": "adaptive", "display": "omitted" }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "kiro-guard",
+      "description": "Blocks destructive Kubernetes, Helm, Azure and IaC commands, and edits to Kiro guard/credential files. Exit 2 blocks the tool call.",
+      "trigger": "PreToolUse",
+      "action": { "type": "command", "command": "bash ~/.kiro/hooks/scripts/kiro-guard.sh" },
+      "timeout": 15
+    }
+  ]
+}
