@@ -8,8 +8,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from urllib.parse import quote
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE =os.path.dirname(os.path.abspath(__file__))
 GUARD = os.path.join(HERE, "..", "global", "hooks", "scripts", "kiro-guard.sh")
 
 BLOCK = [
@@ -973,6 +974,9 @@ def main(fails=None):
             problem = "needs a prompt and a tools list"
         elif not isinstance(rules, list) or not rules:
             problem = "needs permissions.rules (the v3 engine skips an agent without them)"
+        elif fn == "fact-check.json" and (not {"fs_read", "fs_write", "shell", "subagent"} <= denied
+                                          or set(agent["tools"]) & {"read", "fs_read", "execute_bash", "shell"}):
+            problem = "fact-check is web only: no read or shell tool, and it denies fs_read, fs_write, shell and subagent"
         elif fn != "fact-check.json" and not {"fs_write", "subagent"} <= denied:
             problem = "a read-only helper denies fs_write and subagent"
         elif fn != "fact-check.json" and "subagent_response" not in agent["prompt"]:
@@ -1131,6 +1135,71 @@ def main(fails=None):
     ]:
         want = tool == "execute_bash" and ti["command"].startswith("tail -3 config")   # a reader names the file: sent to kiro-run
         expect("", want, base, "secret-read/clean", tool=tool, tool_input=ti)
+    # web search and fetch: version, documentation, changelog, registry and CVE lookups pass; a query or URL that
+    # carries data from this machine is refused without repeating a secret value
+    for tool, ti in [
+        ("web_search", {"query": "terraform-provider-azurerm 3.116.0 changelog azurerm_kubernetes_cluster"}),
+        ("web_search", {"query": "\"no matches for kind \\\"Ingress\\\" in version \\\"extensions/v1beta1\\\"\" kubectl 1.22"}),
+        ("web_search", {"query": "\"Could not load file or assembly System.Runtime, Version=10.0.0.0\" .NET 10"}),
+        ("web_search", {"query": "Chrome 126.0.6478.127 release notes"}),
+        ("web_search", {"query": "CVE-2024-3094 xz-utils affected versions"}),
+        ("web_search", {"query": "IMDSv2 169.254.169.254 hop limit EKS 1.30"}),
+        ("web_search", {"query": "my-svc.my-namespace.svc.cluster.local DNS record format kubernetes 1.31"}),
+        ("web_search", {"query": "host.docker.internal not resolving Docker Desktop 4.30"}),
+        ("web_search", {"query": "us-west-2.compute.internal node name EKS"}),
+        ("web_search", {"query": "IllegalAccessError jdk.internal.misc.Unsafe JDK 21"}),
+        ("web_search", {"query": "Microsoft.Extensions.Internal namespace .NET 8"}),
+        ("web_search", {"query": "%USERPROFILE%\\AppData\\Roaming\\npm C:\\Users\\Public npm 10"}),
+        ("web_search", {"query": "contoso landing zone bicep 0.30"}),                # no WEB_PRIVATE_NAMES by default
+        ("web_fetch", {"url": "https://github.com/kubernetes/kubernetes/commit/4b8a1d5c0c2e8d7f3a9b6e1f0d2c4a8b7e6f5d3c",
+                       "mode": "truncated"}),
+        ("web_fetch", {"url": "https://learn.microsoft.com/en-us/cli/azure/aks?view=azure-cli-latest#az-aks-create",
+                       "mode": "selective", "searchPhrase": "--node-vm-size"}),
+        ("web_fetch", {"url": "https://registry.terraform.io/providers/hashicorp/azurerm/3.116.0/docs/resources/kubernetes_cluster"}),
+        ("web_fetch", {"url": "https://pypi.org/project/requests/2.32.3/"}),
+        ("web_fetch", {"url": "https://nvd.nist.gov/vuln/detail/CVE-2024-3094"}),
+    ]:
+        expect("", False, base, "web/public", tool=tool, tool_input=ti)
+    token = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+    web_leaks = [
+        ("web_search", {"query": "def handler(event):\n    return db.query(event)"}, "several lines", base),
+        ("web_search", {"query": "error " + "x1y2z3 " * 70}, "characters", base),
+        ("web_fetch", {"url": "https://example.org/?q=" + "A1b2C3" * 120}, "characters", base),
+        ("web_search", {"query": token + " bad credentials"}, "a secret value (GitHub token)", base),
+        ("web_search", {"query": "abc123456789 rejected by the API"}, "a secret value", base),     # TOKEN in .env
+        ("web_search", {"query": "permission denied %s/app/values.yaml" % tmp_home}, "a local path", base),
+        ("web_fetch", {"url": "https://example.org/q?d=" + quote(tmp_home + "/.ssh/id_rsa", safe="")}, "a local path", base),
+        ("web_search", {"query": "error in %s/app/values.yaml" % tmp}, "a local path",                # the project, outside HOME
+         dict(base, HOME=os.path.join(os.sep, "nonexistent", "home-x"))),
+        ("web_search", {"query": "C:\\Users\\jkowalski\\AppData\\Local\\Temp access denied"}, "a user profile path", base),
+        ("web_search", {"query": "dial tcp 10.20.30.40:5432 i/o timeout postgres 16"}, "a private IP address", base),
+        ("web_fetch", {"url": "https://example.org/status?host=192.168.1.15"}, "a private IP address", base),
+        ("web_search", {"query": "fd12:3456:789a::1 unreachable"}, "a private IPv6 address", base),
+        ("web_search", {"query": "payments-db.prod.svc.cluster.local connection refused"}, "an internal host name", base),
+        ("web_search", {"query": "ip-10-0-1-5.ec2.internal NotReady"}, "an internal host name", base),
+    ]
+    for tool, ti, piece, env in web_leaks:
+        rc, err = run("", env, tmp, tool=tool, tool_input=ti)
+        if rc != 2 or piece not in err or token in err or "abc123456789" in err or "- BLOCKED by kiro-guard: web " not in err:
+            fails.append("web/leak: expected a block naming %r (red line, no secret value) for %s %r, rc=%s %s"
+                         % (piece, tool, ti, rc, err[:160]))
+        expect("", False, env, "web/off", tool=tool, tool_input=ti, guard=g(WEB_OUTBOUND="off"))
+    for label, ti, want, env, guard in [
+        ("private names", {"query": "Contoso landing zone bicep 0.30"}, True, base, g(WEB_PRIVATE_NAMES="contoso|project-falcon")),
+        ("private names: others pass", {"query": "Fabrikam landing zone bicep 0.30"}, False, base, g(WEB_PRIVATE_NAMES="contoso|project-falcon")),
+        ("invalid WEB_PRIVATE_NAMES matched literally", {"query": "globex sso setup"}, True, base, g(WEB_PRIVATE_NAMES="acme(|globex")),
+        ("invalid WEB_OUTBOUND acts as block", {"query": "dial tcp 10.20.30.40:5432"}, True, base, g(WEB_OUTBOUND="blocking")),
+        ("env cannot turn the web check off", {"query": "dial tcp 10.20.30.40:5432"}, True, dict(base, KIRO_WEB_OUTBOUND="off"), None),
+        ("env can turn it on", {"query": "dial tcp 10.20.30.40:5432"}, True, dict(base, KIRO_WEB_OUTBOUND="block"), g(WEB_OUTBOUND="off")),
+    ]:
+        expect("", want, env, "web/conf/" + label, tool="web_search", tool_input=ti, guard=guard)
+    try:
+        with open(base["KIRO_LOG_FILE"], encoding="utf-8") as fh:
+            logged = fh.read()
+    except OSError:
+        logged = ""
+    if "abc123456789" in logged or token in logged or "dial tcp 10.20.30.40" not in logged:
+        fails.append("web/log: a refused search is logged, a secret value it carried is not")
     # nothing but the block message on stderr (no interpreter warnings leaking into the agent's context)
     rc, err = run("terraform destroy", base, tmp, tool="execute_bash")
     if rc != 2 or not err.startswith("BLOCKED by kiro-guard"):

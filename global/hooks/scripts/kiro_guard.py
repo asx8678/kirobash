@@ -41,6 +41,7 @@ LEVELS = {
     "GUARD_MODE": ("off", "destructive", "readonly"),
     "CODE_MODE": ("off", "prefer", "inline", "enforce"),
     "SECRET_READS": ("off", "mask"),
+    "WEB_OUTBOUND": ("off", "block"),               # web search/fetch: refuse a query or URL that carries local data
     "RUN_SANDBOX": ("off", "auto", "require"),      # kiro-run: run programs in an OS sandbox
     "RUN_SANDBOX_NET": ("allow", "deny"),           # kiro-run: network inside the sandbox
     "RUN_ALLOW_ADMIN": ("1", "0"),                  # kiro-run: 1 = run cloud programs without read-only credentials
@@ -49,6 +50,8 @@ CONF_DEFAULTS = {
     "GUARD_MODE": "destructive",
     "CODE_MODE": "enforce",
     "SECRET_READS": "mask",
+    "WEB_OUTBOUND": "block",
+    "WEB_PRIVATE_NAMES": "",
     "RUN_SANDBOX": "off",
     "RUN_SANDBOX_NET": "deny",
     "RUN_ALLOW_ADMIN": "0",
@@ -103,6 +106,15 @@ def load_conf():
     except re.error:
         CONF_PROBLEMS.append(("FAIL", "LOCAL_CONTEXTS is not a valid regular expression: no context counts as local"))
         conf["LOCAL_CONTEXTS"] = r"(?!)"
+    if os.environ.get("KIRO_WEB_PRIVATE_NAMES"):
+        CONF_PROBLEMS.append(("WARN", "KIRO_WEB_PRIVATE_NAMES ignored: private names are set in kiro-guard.conf only"))
+    try:
+        re.compile(conf["WEB_PRIVATE_NAMES"])
+    except re.error:
+        # still refused, each |-separated name taken literally
+        CONF_PROBLEMS.append(("FAIL", "WEB_PRIVATE_NAMES is not a valid regular expression: each |-separated "
+                                      "name is matched literally"))
+        conf["WEB_PRIVATE_NAMES"] = "|".join(re.escape(n) for n in conf["WEB_PRIVATE_NAMES"].split("|") if n)
     conf["LOG_FILE"] = os.path.expanduser(conf["LOG_FILE"])
     return conf
 
@@ -2212,6 +2224,93 @@ def command_reads_secrets(cmd, cwd):
             % (found[0], ", ".join(found[1][:3]), cmd.strip()))
 
 
+# ---------------------------------------------------------- outbound web ---
+# A web search query and a fetched URL leave this machine. The steering and the fact-check prompt say what may go
+# out (product, version, public names, the generic wording of an error); this is the net under them. It refuses a
+# query or URL that carries a secret value, a path of this machine, a private address, an internal host name, a
+# name listed in WEB_PRIVATE_NAMES, or a block of text, and nothing else: version numbers, documentation,
+# changelogs, registries, CVE and issue pages stay reachable.
+WEB_TOOLS = {"web_search", "remote_web_search", "websearch", "web_fetch", "webfetch"}
+WEB_LOCAL_PARAMS = {"mode", "searchPhrase", "search_phrase"}     # web_fetch applies these to the page, here
+WEB_QUERY_MAX, WEB_URL_MAX = 400, 600
+IPV4_RE = re.compile(r"(?<![\w.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\w|\.\w)")
+ULA_RE = re.compile(r"(?<![\w:])f[cd][0-9a-f]{2}:[0-9a-f]{0,4}:[0-9a-f:]*", re.I)       # fc00::/7
+# lower case only, so a .NET namespace (Microsoft.Extensions.Internal) is not taken for a host
+INTERNAL_HOST_RE = re.compile(r"(?<![\w.-])((?:[a-z0-9-]+\.)+)(internal|corp|lan|intranet|intra|home\.arpa|cluster\.local)"
+                              r"(?![\w-]|\.\w)")
+# the labels of names that documentation uses for everyone: my-svc.my-namespace.svc.cluster.local,
+# host.docker.internal, us-west-2.compute.internal, metadata.google.internal, jdk.internal
+GENERIC_HOST_LABEL = re.compile(r"(svc|pods?|default|kube-system|kube-dns|kubernetes|my-[a-z0-9-]+|namespace|service|"
+                                r"ec2|compute|[a-z]{2}(-[a-z]+)+-\d|docker|host|gateway|metadata|google|example|"
+                                r"jdk|sun|java|javax|kotlin)")
+WIN_PROFILE_RE = re.compile(r"(?:\b[A-Za-z]:|/mnt/[a-z])[\\/]+Users[\\/]+([^\\/\s\"'<>%$]+)", re.I)
+GENERIC_PROFILES = {"public", "default", "all", "user", "username", "runneradmin", "you", "yourname", "name"}
+
+
+def web_refusal(what, tool):
+    kind = "fetch" if "fetch" in tool else "search"
+    return ("BLOCKED by kiro-guard: this web %s would send %s from this machine to the internet. Nothing was sent. "
+            "A query or URL carries public facts only: product, version, public package, flag, API or resource-type "
+            "names, a CVE or issue id, the generic wording of an error. Leave this out and search again; never "
+            "encode, split or reword it to get it past this check." % (kind, what)) + \
+        must_see("web %s with %s" % (kind, what))
+
+
+def web_leak(tool, ti, cwd):
+    """Message when a web search or fetch would send data from this machine, else None."""
+    if CONF["WEB_OUTBOUND"] != "block":
+        return None
+    from urllib.parse import unquote_plus
+    fetch = "fetch" in tool
+    sent = [v for k, v in sorted(ti.items()) if k not in WEB_LOCAL_PARAMS and isinstance(v, str) and v.strip()]
+    texts = []
+    for v in sent:
+        texts.append(v)
+        decoded = unquote_plus(unquote_plus(v)) if fetch else v           # %2Fhome%2F... is still a path
+        if decoded != v:
+            texts.append(decoded)
+    for t in texts:
+        if "\n" in t.strip() or "\r" in t.strip():
+            return web_refusal("several lines of text (code, a file or a log)", tool)
+    for v in sent:
+        size, limit = (len(v.split("#")[0]), WEB_URL_MAX) if fetch else (len(v), WEB_QUERY_MAX)
+        if size > limit:
+            return web_refusal("%d characters (a %s needs no more than %d: is it code or file content?)"
+                               % (size, "documentation URL" if fetch else "search query", limit), tool)
+    homes = []
+    for p in (HOME, os.path.realpath(HOME), cwd, os.path.realpath(cwd)):
+        p = p.rstrip("/\\")
+        if p.count("/") >= 2 and len(p) >= 6 and p not in homes:
+            homes.append(p)
+    private = re.compile(CONF["WEB_PRIVATE_NAMES"], re.I) if CONF["WEB_PRIVATE_NAMES"] else None
+    for t in texts:
+        hits = secrets_in_lines([t], cwd) if secret_libs() else []
+        if hits:
+            return web_refusal("a secret value (%s)" % ", ".join(hits[0][1][:2]), tool)
+        for p in homes:
+            if re.search(re.escape(p) + r"(?![\w.-])", t):
+                return web_refusal("a local path (%s)" % p, tool)
+        m = WIN_PROFILE_RE.search(t)
+        if m and m.group(1).lower() not in GENERIC_PROFILES:
+            return web_refusal("a user profile path (%s)" % m.group(0), tool)
+        for m in IPV4_RE.finditer(t):
+            a, b = int(m.group(1)), int(m.group(2))
+            if max(int(x) for x in m.groups()) > 255 or re.search(r"ver(sion)?\W{0,2}$", t[max(0, m.start() - 10):m.start()], re.I):
+                continue                                                  # Version=10.0.0.0 is an assembly version
+            if a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127):
+                return web_refusal("a private IP address (%s)" % m.group(0), tool)
+        m = ULA_RE.search(t)
+        if m and not m.group(0).lower().startswith("fd00:ec2::"):          # fd00:ec2::254 is the AWS metadata address
+            return web_refusal("a private IPv6 address (%s)" % m.group(0), tool)
+        for m in INTERNAL_HOST_RE.finditer(t):
+            if not all(GENERIC_HOST_LABEL.fullmatch(x) for x in m.group(1).split(".") if x):
+                return web_refusal("an internal host name (%s)" % m.group(0), tool)
+        m = private.search(t) if private else None
+        if m:
+            return web_refusal("a name listed in WEB_PRIVATE_NAMES (%s)" % m.group(0), tool)
+    return None
+
+
 # ---------------------------------------------------- context resolution ---
 def kube_is_local(k8s):
     if not k8s:
@@ -2438,6 +2537,19 @@ def main():
             msg = None                  # this check is a safety net; it never stops a read by failing
         if msg:
             log("REDIRECT", tool, json.dumps(ti)[:400], "would show secret values")
+            sys.stderr.write(msg + "\n")
+            return 2
+        return 0
+
+    # 1c. web search and fetch: the query or URL leaves this machine
+    if tl in WEB_TOOLS:
+        try:
+            msg = web_leak(tl, ti, cwd)
+        except Exception:
+            msg = None                  # like the read check, a safety net that never stops a search by failing
+        if msg:
+            shown = "[not logged: it holds a secret value]" if "a secret value" in msg else json.dumps(ti)[:400]
+            log("BLOCK", tool, shown, "would send data from this machine")
             sys.stderr.write(msg + "\n")
             return 2
         return 0

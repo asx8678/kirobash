@@ -192,6 +192,18 @@ if [ "$sr" = mask ]; then
 else
   warnf "SECRET_READS=$sr: reads are not checked for secret values"
 fi
+wo=$(cget WEB_OUTBOUND block)
+if [ "$wo" = block ]; then
+  wq() { python3 -c 'import json,os,sys; print(json.dumps({"hook_event_name":"PreToolUse","tool_name":"web_search","cwd":os.getcwd(),"tool_input":{"query":sys.argv[1]}}))' "$1" | bash "$g" >/dev/null 2>&1; echo $?; }
+  [ "$(wq 'dial tcp 10.20.30.40:5432 i/o timeout')" = 2 ] && [ "$(wq "permission denied $HOME/.ssh/config")" = 2 ] \
+    && pass "web: a search that carries a private address or a local path is refused" || failf "web searches can send private addresses and local paths"
+  [ "$(wq 'kubernetes 1.31 release notes policy/v1beta1')" = 0 ] && pass "web: version and documentation searches go through" || failf "web: a plain version search is refused"
+else
+  warnf "WEB_OUTBOUND=$wo: web searches and fetches are not checked for data from this machine"
+fi
+python3 -c 'import json, sys; a = json.load(open(sys.argv[1])); d = {r["capability"] for r in a["permissions"]["rules"] if r["effect"] == "deny"}
+sys.exit(0 if {"fs_read", "shell"} <= d and "read" not in a["tools"] else 1)' "$K/agents/fact-check.json" 2>/dev/null \
+  && pass "fact-check: web only, it cannot read files it could send" || warnf "fact-check can read files (an older copy: run install.sh)"
 r="$K/hooks/scripts/skill-router.sh"
 if [ -f "$r" ]; then
   [ "$(printf '{"hook_event_name":"UserPromptSubmit","prompt":"review this repo"}' | bash "$r" | grep -c '^## Method\|^## Output')" = 2 ] && [ -z "$(printf '{"hook_event_name":"UserPromptSubmit","prompt":"fix the typo"}' | bash "$r")" ] \
