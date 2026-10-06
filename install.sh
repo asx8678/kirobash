@@ -31,7 +31,16 @@ for f in "$here"/global/hooks/*.json; do backup_file "$K/hooks/$(basename "$f")"
 for f in "$here"/global/hooks/scripts/*; do
   [ -f "$f" ] || continue                       # skip __pycache__ and other directories
   base="$(basename "$f")"
-  if [ "$base" = "kiro-guard.conf" ] && [ -f "$K/hooks/scripts/$base" ]; then continue; fi  # keep your settings
+  if [ "$base" = "kiro-guard.conf" ] && [ -f "$K/hooks/scripts/$base" ]; then
+    # your settings stay; the file gets this version's comments and any new setting with its safe default
+    if command -v python3 >/dev/null 2>&1; then
+      backup_file "$K/hooks/scripts/$base"
+      python3 "$here/global/lib/kiro_migrate.py" conf "$f" "$K/hooks/scripts/$base"
+    else
+      echo "kiro-guard.conf: kept as it is (python3 missing, so new settings were not added; their defaults apply)"
+    fi
+    continue
+  fi
   cp "$f" "$K/hooks/scripts/"
 done
 chmod +x "$K/hooks/scripts/"*.sh "$K/hooks/scripts/kiro_guard.py"
@@ -49,28 +58,15 @@ else
   cp "$here/global/kiroignore" "$K/settings/kiroignore"
 fi
 
-# permissions.yaml
+# permissions.yaml: a three-way merge against the pack rules the last install wrote (.kiro-pack-rules.yaml),
+# so rules the pack dropped or changed go, new ones arrive, and the rules you added or removed stay as you left them
 rendered="$(mktemp)"; sed "s|__HOME__|$HOME|g" "$here/global/permissions.yaml.tmpl" > "$rendered"
-perm="$K/settings/permissions.yaml"
+perm="$K/settings/permissions.yaml"; pack_rules="$K/settings/.kiro-pack-rules.yaml"
 if [ ! -f "$perm" ]; then
-  cp "$rendered" "$perm"; echo "permissions: installed $perm"
+  cp "$rendered" "$perm"; cp "$rendered" "$pack_rules"; echo "permissions: installed $perm"
 elif python3 -c 'import yaml' 2>/dev/null; then
   backup_file "$perm"
-  python3 - "$perm" "$rendered" <<'PY'
-import sys, yaml
-cur_path, new_path = sys.argv[1], sys.argv[2]
-cur = yaml.safe_load(open(cur_path)) or {}
-new = yaml.safe_load(open(new_path)) or {}
-rules = cur.get("rules") or []
-for r in new.get("rules", []):
-    if r not in rules:
-        rules.append(r)
-cur["rules"] = rules
-with open(cur_path, "w") as fh:
-    fh.write("# merged with kiro-pack rules; previous version backed up\n")
-    yaml.safe_dump(cur, fh, sort_keys=False, default_flow_style=False)
-print("permissions: merged pack rules into", cur_path)
-PY
+  python3 "$here/global/lib/kiro_migrate.py" perms "$perm" "$rendered" "$pack_rules"
 else
   cp "$rendered" "$K/settings/permissions.kiro-pack.yaml"
   echo "permissions: $perm exists and PyYAML is missing; merge $K/settings/permissions.kiro-pack.yaml into it by hand." >&2

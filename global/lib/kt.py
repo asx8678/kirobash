@@ -14,6 +14,7 @@ Read-only repo inspection that keeps output small and keeps secrets out of it.
   kt.outline("internal/**/*.go")          functions/types with line numbers
   kt.show("path", 120, 160)               numbered lines of a range (or around=140)
   kt.sh("go vet ./...", tail=40)          run a command; prints the exit code and the last lines
+  kt.partition(max_lines=3000, parts=4)   split a project too large for one context into folder groups, one per helper
 
 Each function prints its findings and returns the data, so call it bare (`kt.tree()`), or pass
 quiet=True to get only the data. Listings and searches skip what .gitignore and .kiroignore hide.
@@ -1306,6 +1307,112 @@ def tree(depth=2, root=".", quiet=False):
     return _Info(info)
 
 
+# -------------------------------------------------------------- partition ---
+def _unsafe_target(t):
+    """Why a target path cannot be a partition root (it must stay inside the project), or None."""
+    if t.startswith("~"):
+        return "starts with ~"
+    if os.path.isabs(t) or t.startswith("\\"):
+        return "absolute path"
+    if ".." in re.split(r"[\\/]+", t):
+        return "contains .."
+    return None
+
+
+def partition(max_lines=3000, parts=4, targets=None, root=".", quiet=False):
+    """Split the project (or the folders in `targets`) into at most `parts` non-overlapping groups of
+    folders, each at most about `max_lines` lines, one group per helper: a folder that is too large is
+    split into its subfolders, and the smallest groups are filled first. What does not fit goes into
+    `rest`, for a second round. Returns {"parts": [{"name", "globs", "files", "lines"}], "rest": [...],
+    "lines": n, "rejected": [(path, why)]}; each part's globs go straight into kt.read() or kt.review()."""
+    names = [n for n in _all_files(root) if _kind_rel(n, root) is None]
+    rejected, roots = [], []
+    for t in ([targets] if isinstance(targets, str) else list(targets or [])):
+        why = _unsafe_target(t)
+        if why:
+            rejected.append((t, why))
+            continue
+        t = t.strip().strip("/").replace("\\", "/")
+        if t.endswith("/**"):
+            t = t[:-3]
+        if not any(n == t or n.startswith(t + "/") for n in names):
+            rejected.append((t, "no files there"))
+        else:
+            roots.append(t)
+    # a target inside another target is already covered by it
+    roots = sorted(set(roots))
+    roots = [t for t in roots if not any(t != p and t.startswith(p + "/") for p in roots)]
+    if targets is not None:
+        names = [n for n in names if any(n == t or n.startswith(t + "/") for t in roots)]
+    size = {n: len(_read(os.path.join(root, n)) or []) for n in names}
+
+    def below(d):
+        return [n for n in names if d == "" or n.startswith(d + "/") or n == d]
+
+    units, stack = [], (roots if targets is not None else [""])
+    stack = list(stack)
+    while stack:
+        d = stack.pop()
+        members = below(d)
+        total = sum(size[n] for n in members)
+        if d and (total <= max_lines or os.path.isfile(os.path.join(root, d))):
+            glob = d if os.path.isfile(os.path.join(root, d)) else d + "/**"
+            units.append((glob, len(members), total))
+            continue
+        depth = len(d.split("/")) if d else 0
+        here = [n for n in members if len(n.split("/")) == depth + 1]
+        subdirs = sorted({"/".join(n.split("/")[:depth + 1]) for n in members if len(n.split("/")) > depth + 1})
+        stack.extend(reversed(subdirs))
+        loose = sum(size[n] for n in here)
+        if here and loose <= max_lines:
+            units.append(((d + "/*") if d else here, len(here), loose))     # the files directly in d
+        else:
+            units.extend((n, 1, size[n]) for n in here)
+    bins, rest = [], []
+    for glob, count, lines in sorted(units, key=lambda u: -u[2]):
+        fits = [b for b in bins if b["lines"] + lines <= max_lines]
+        if fits:
+            b = min(fits, key=lambda b: b["lines"])
+        elif len(bins) < parts:
+            b = {"globs": [], "files": 0, "lines": 0, "_biggest": None}
+            bins.append(b)
+        else:
+            rest.append({"globs": glob if isinstance(glob, list) else [glob], "files": count, "lines": lines})
+            continue
+        if b["_biggest"] is None:                      # units come largest first: the first one names the part
+            b["_biggest"] = "top" if isinstance(glob, list) else glob
+        b["globs"] += glob if isinstance(glob, list) else [glob]
+        b["files"] += count
+        b["lines"] += lines
+    seen = {}
+    for b in sorted(bins, key=lambda b: -b["lines"]):
+        b["globs"].sort()
+        base = b.pop("_biggest").replace("/**", "").replace("/*", "")
+        words, base = [w for w in re.split(r"[^a-z0-9]+", base.lower()) if w], ""
+        while words and len(words[-1]) + len(base) < 24:      # the most specific folder names, whole words
+            base = words.pop() + ("-" + base if base else "")
+        base = base or "top"
+        seen[base] = seen.get(base, 0) + 1
+        b["name"] = base if seen[base] == 1 else "%s-%d" % (base, seen[base])
+    bins.sort(key=lambda b: b["globs"][0])
+    total = sum(size.values())
+    info = {"parts": bins, "rest": rest, "lines": total, "rejected": rejected}
+    if quiet:
+        return info
+    covered = sum(b["lines"] for b in bins)
+    if total <= max_lines and not rest:
+        print("%d files, %d lines: fits one context (max %d per part); read it directly" % (len(names), total, max_lines))
+    print("%d part%s of at most %d lines; covered %d of %d lines" % (len(bins), "" if len(bins) == 1 else "s",
+                                                                     max_lines, covered, total))
+    for b in bins:
+        print("  %-24s %5d files %7d lines  %s" % (b["name"], b["files"], b["lines"], " ".join(b["globs"])))
+    if rest:
+        print("not covered (a second round): " + "; ".join("%s (%d lines)" % (" ".join(r["globs"]), r["lines"]) for r in rest))
+    for t, why in rejected:
+        print("rejected target %s: %s" % (t, why))
+    return _Info(info)
+
+
 # --------------------------------------------------------------------- sh ---
 def sh(cmd, tail=40, timeout=60, cwd=None, quiet=False):
     """Run a command (a string runs in bash with pipefail, a list is an argv). Prints `$ cmd -> exit N`
@@ -1336,7 +1443,8 @@ def sh(cmd, tail=40, timeout=60, cwd=None, quiet=False):
 def _main(argv):
     """python3 -m kt <function> [args...]: positional args are passed as strings, or as ints when numeric."""
     fns = {"tree": tree, "files": files, "grep": grep, "outline": outline, "show": show, "sh": sh, "hidden": hidden,
-           "read": read, "secrets": secrets, "risky": risky, "calls": calls, "survey": survey, "review": review, "tools": tools}
+           "read": read, "secrets": secrets, "risky": risky, "calls": calls, "survey": survey, "review": review, "tools": tools,
+           "partition": partition}
     if len(argv) < 2 or argv[1] not in fns:
         print(__doc__.strip())
         return 2

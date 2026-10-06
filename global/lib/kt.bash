@@ -4,7 +4,7 @@
 #   kt.sh "helm lint chart"   runs a command with a 60 s limit (KT_SH_TIMEOUT), all of its output, its exit code
 # `kt.show path` works too, for programs written the Python way.
 kt() { if [ "${1:-}" = sh ]; then shift; kt.sh "$@"; else python3 -m kt "$@"; fi; }
-for _kt_fn in review survey tree read secrets risky calls tools files grep outline show hidden; do
+for _kt_fn in review survey tree read secrets risky calls tools files grep outline show hidden partition; do
   eval "kt.${_kt_fn}() { python3 -m kt ${_kt_fn} \"\$@\"; }"
 done
 unset _kt_fn

@@ -9,6 +9,9 @@ those calls fit in one step.
 
   kiro_page.py first <file> <chars> <prefix> <id>    print part 1 and how to get the rest; save the rest
                                                      as <prefix>.part2, <prefix>.part3 ...
+  kiro_page.py fail <file> <lines> <chars> <rc> <full> [extra]
+                                                     a failed run in one result: its start, its last lines
+                                                     (the error) and the exit code; no parts
 """
 import sys
 
@@ -80,9 +83,51 @@ def first(path, budget, prefix, run_id):
     return 0
 
 
+TAIL = 60          # a failed run shows its last lines: that is where the traceback or the error is
+
+
+def fail(path, max_lines, budget, rc, full, extra):
+    """A failed run in one result: the whole output when it fits, otherwise its start, a marker and its
+    last TAIL lines, both within the line cap and the character budget. Ends with the exit code."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines(True)
+    end = "[kiro-run: exit %s]\n" % rc
+    if extra:
+        end += extra if extra.endswith("\n") else extra + "\n"
+    if len(lines) <= max_lines and units("".join(lines)) + units(end) <= budget:
+        text = "".join(lines)
+        sys.stdout.write(text + ("" if not text or text.endswith("\n") else "\n") + end)
+        return 0
+    tail = lines[-TAIL:]
+    while len(tail) > 1 and units("".join(tail)) > budget // 2:     # very long lines: fewer of them
+        tail = tail[1:]
+    tail_text = "".join(tail)
+    if units(tail_text) > budget // 2:
+        tail_text = tail_text[-(budget // 4):]
+    end = ("[kiro-run: exit %s; full output: %s — read it with kt.show or grep instead of running the "
+           "program again]\n" % (rc, full)) + (extra if not extra or extra.endswith("\n") else extra + "\n")
+    room = budget - units(tail_text) - units(end) - 200
+    head, size = [], 0
+    for line in lines[:max(0, min(max_lines - len(tail), len(lines) - len(tail)))]:
+        n = units(line)
+        if size + n > room:
+            break
+        head.append(line)
+        size += n
+    skipped = len(lines) - len(head) - len(tail)
+    sys.stdout.write("".join(head))
+    if head and not head[-1].endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.write("... [kiro-run: %d lines not shown; the last %d lines follow]\n" % (skipped, len(tail)))
+    sys.stdout.write(tail_text + ("" if tail_text.endswith("\n") else "\n") + end)
+    return 0
+
+
 def main(argv):
     if len(argv) == 6 and argv[1] == "first":
         return first(argv[2], max(2000, int(argv[3])), argv[4], argv[5])
+    if len(argv) in (7, 8) and argv[1] == "fail":
+        return fail(argv[2], int(argv[3]), max(2000, int(argv[4])), argv[5], argv[6], argv[7] if len(argv) == 8 else "")
     sys.stderr.write(__doc__)
     return 64
 

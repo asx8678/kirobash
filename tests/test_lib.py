@@ -190,6 +190,33 @@ def main():
     check("tree: names what is hidden, secrets marked", True,
           "hidden by .kiroignore, 9 files:" in out and "config/secrets/app.xml (secrets)" in out and "data/big.sql" in out)
 
+    # ---- partition: folder groups for helpers, no overlap, nothing lost
+    info, out = capture(kt.partition, max_lines=100000)
+    check("partition: a small project fits one context", (1, [], info["lines"], True),
+          (len(info["parts"]), info["rest"], kt.tree(quiet=True)["lines"], "fits one context" in out))
+
+    def owners(info):
+        globs = [g for b in info["parts"] + info["rest"] for g in b["globs"]]
+        return {f: [g for g in globs if f in kt.files(g)] for f in visible}
+    info, out = capture(kt.partition, max_lines=10, parts=3)
+    own = owners(info)
+    check("partition: every visible file is in exactly one group or in the rest", [], [f for f, gs in own.items() if len(gs) != 1])
+    check("partition: at most `parts` groups, the rest named for a second round", (3, True, True),
+          (len(info["parts"]), bool(info["rest"]), "not covered (a second round)" in out))
+    check("partition: a group stays within max_lines unless one file alone is larger", [],
+          [b["name"] for b in info["parts"] if b["lines"] > 10 and len(b["globs"]) > 1])
+    check("partition: group names are unique", True, len({b["name"] for b in info["parts"]}) == len(info["parts"]))
+    check("partition: hidden files are never part of a group", [], [f for f in (".env", "config/secrets/db.yaml") if f in own])
+    info, out = capture(kt.partition, max_lines=1000, targets=["../up", "~/x", "/etc", "nope", "chart", "chart/templates"])
+    check("partition: targets outside the project or without files are rejected, a target inside another is dropped",
+          (["../up", "~/x", "/etc", "nope"], True),
+          ([t for t, _ in info["rejected"]], all(g.startswith("chart/") for b in info["parts"] for g in b["globs"])))
+    check("partition: rejected targets are printed with the reason", True,
+          "rejected target ../up: contains .." in out and "rejected target /etc: absolute path" in out)
+    p = subprocess.run([sys.executable, "-m", "kt", "partition", "max_lines=100000"], capture_output=True, text=True,
+                       env=dict(os.environ, PYTHONPATH=os.path.join(HERE, "..", "global", "lib")))
+    check("partition: python3 -m kt partition (the bash form)", True, "fits one context" in p.stdout)
+
     # ---- read: a batch of files in one go
     rows, out = capture(kt.read, "**/*.{go,py,ts}")
     check("read: prints every matching file whole, numbered", (["main.go", "pkg/util.py", "web/app.ts"], True),
@@ -352,6 +379,33 @@ def main():
     check("skill-router: a change to plan gets the planning method with all three helpers", (True, True, True),
           ('"role": "skeptic"' in out, '"role": "scout"' in out, "## Plan" in out))
     check("skill-router: other prompts still get nothing", "", route("fix the typo in README", "sess_a"))
+    for name in ("spec-check", "large-task"):
+        os.makedirs(os.path.join(rhome, ".kiro", "skills", name))
+        shutil.copy(os.path.join(HERE, "..", "global", "skills", name, "SKILL.md"), os.path.join(rhome, ".kiro", "skills", name))
+    for k, (prompt, want) in enumerate([
+            ("check this against the spec", "spec-check"), ("does the implementation meet the requirements in docs/req.md?", "spec-check"),
+            ("verify the acceptance criteria for the checkout feature", "spec-check"), ("is everything in the ticket done?", "spec-check"),
+            ("check the work against .kiro/specs/checkout/requirements.md", "spec-check"), ("are the acceptance criteria met?", "spec-check"),
+            ("does the PR satisfy all the requirements of JIRA-123", "spec-check"), ("review this PR against the ticket", "spec-check"),
+            ("did we implement everything in the spec?", "spec-check"),
+            ("write a spec for the login page", None), ("update requirements.txt with pytest", None), ("review the spec", "code-review"),
+            ("plan how to meet the requirements of the new API", "plan"), ("implement the spec in .kiro/specs/checkout", None),
+            ("make the build meet the requirements of SOC2", None), ("check the values against the schema", None),
+            ("the requirements are unclear, what do you think", None),
+            ("map the whole repo", "large-task"), ("explain how the whole system works", "large-task"),
+            ("give me an architecture overview of this repo", "large-task"), ("document every service's endpoints", "large-task"),
+            ("survey all the helm charts for missing limits", "large-task"), ("inventory everything the migration touches", "large-task"),
+            ("review the whole repo", "code-review"), ("make a plan to migrate all services", "plan"),
+            ("find all services that use redis", None), ("explain this function", None), ("describe each step of the pipeline", None)]):
+        out = route(prompt, "route2-%d" % k)
+        got = next((n for n in ("spec-check", "code-review", "troubleshoot", "plan", "large-task") if "The %s skill is given below" % n in out), None)
+        check("skill-router: %r -> %s" % (prompt, want), want, got)
+    out = route("is everything in the ticket implemented?", "sess_s")
+    check("skill-router: a spec check gets its method with the auditor stages", (True, True, True, False),
+          ("## Method" in out, '"role": "auditor"' in out, "## Spec check" in out, "name: spec-check" in out))
+    out = route("map the whole repo for me", "sess_l")
+    check("skill-router: work too large for one context gets the split-by-size method", (True, True, True),
+          ("kt.partition" in out, '"role": "scout"' in out, "Covered" in out))
 
     # ---- redaction
     import kiro_redact
@@ -614,6 +668,77 @@ def main():
                                       "correct-horse-battery-staple", "Summer-2024")])
     check("hint: words under a key called password are not called a plain setting", ("   <- unclear, 11 chars", "   <- plain setting, 9 chars"),
           (kt._line_hint("db_password: summer-2024"), kt._line_hint("AWS_REGION=eu-west-1")))
+
+    # ---- kiro_migrate: an installed kiro-guard.conf and permissions.yaml brought up to this version ----
+    import kiro_migrate as mig
+    tmpl = "# head\nA=1\n# about B\nB=two\n# new in this version\nC=x\n"
+    text, added, extra = mig.merge_conf(tmpl, "A=9\n# my own note\nZ=keep me\nB=Not Valid\n")
+    check("conf: the user's values stay as written, a new setting comes with its comment and default, unknown ones are kept at the end",
+          ("# head\nA=9\n# about B\nB=Not Valid\n# new in this version\nC=x\n\n" + mig.KEPT_HEADER + "\nZ=keep me\n", ["C"], ["Z"]),
+          (text, added, extra))
+    check("conf: migrating twice changes nothing", text, mig.merge_conf(tmpl, text)[0])
+    check("conf: a later line wins and commented settings are not settings", {"A": "2"}, mig.settings("A=1\n#B=3\n  # C=4\nA=2\n"))
+    r1, r2, r2b, r3 = ({"capability": "shell", "match": [m], "effect": "deny"} for m in ("a *", "b *", "b2 *", "c *"))
+    mine = {"capability": "shell", "match": ["my-tool *"], "effect": "allow"}
+    check("rules: a rule the pack dropped or changed goes, new pack rules arrive, the user's own rule stays",
+          ([r1, mine, r2b, r3], [r2b, r3], [r2]), mig.merge_rules([r1, r2, mine], [r1, r2b, r3], [r1, r2]))
+    a1 = {"capability": "shell", "match": ["kubectl get *"], "effect": "allow"}
+    check("rules: an allow or ask rule of the pack the user removed stays out", ([r2, mine], [], []),
+          mig.merge_rules([r2, mine], [a1, r2], [a1, r2]))
+    check("rules: a deny rule of the pack the user removed comes back", ([r2, mine, r1], [r1], []),
+          mig.merge_rules([r2, mine], [r1, r2], [r1, r2]))
+    check("rules: without a record of the last install's rules, nothing is removed", ([r2, mine, r1], [r1], []),
+          mig.merge_rules([r2, mine], [r1], None))
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    if yaml:
+        # end to end: install over an old-style install, then again, then once more
+        inst = os.path.join(tmp, "inst")
+        os.makedirs(os.path.join(inst, ".kiro", "hooks", "scripts"))
+        conf = os.path.join(inst, ".kiro", "hooks", "scripts", "kiro-guard.conf")
+        with open(conf, "w") as fh:
+            fh.write("# my old settings\nGUARD_MODE=readonly\nCODE_MODE=inline\nMY_NOTE=1\n")
+        env = dict(os.environ, HOME=inst)
+        install = lambda: subprocess.run(["bash", os.path.join(HERE, "..", "install.sh"), "--no-test"], env=env,
+                                         capture_output=True, text=True)
+        p1 = install()
+        with open(conf) as fh:
+            c1 = fh.read()
+        s1 = mig.settings(c1)
+        check("install over an old kiro-guard.conf: values kept, new settings added with their defaults, unknown kept",
+              (0, "readonly", "inline", "off", "deny", "0", "1", True),
+              (p1.returncode, s1.get("GUARD_MODE"), s1.get("CODE_MODE"), s1.get("RUN_SANDBOX"), s1.get("RUN_SANDBOX_NET"),
+               s1.get("RUN_ALLOW_ADMIN"), s1.get("MY_NOTE"),
+               all(k in "".join(l for l in p1.stdout.splitlines() if l.startswith("kiro-guard.conf: added"))
+                   for k in ("RUN_ALLOW_ADMIN", "RUN_SANDBOX", "RUN_SANDBOX_NET"))))
+        perm = os.path.join(inst, ".kiro", "settings", "permissions.yaml")
+        base = os.path.join(inst, ".kiro", "settings", ".kiro-pack-rules.yaml")
+        with open(perm) as fh:
+            pack_rules = yaml.safe_load(fh)["rules"]
+        check("fresh permissions: the pack's file and a record of its rules", (True, pack_rules),
+              (os.path.isfile(base), yaml.safe_load(open(base))["rules"]))
+        # as if the previous pack had shipped one more rule, the user added one and removed the subagent allow
+        old_rule = {"capability": "shell", "match": ["retired-tool *"], "effect": "ask"}
+        sub = next(r for r in pack_rules if r.get("capability") == "subagent")
+        with open(perm, "w") as fh:
+            yaml.safe_dump({"rules": [r for r in pack_rules if r != sub] + [old_rule, mine]}, fh, sort_keys=False)
+        with open(base, "w") as fh:
+            yaml.safe_dump({"rules": pack_rules + [old_rule]}, fh, sort_keys=False)
+        p2 = install()
+        rules2 = yaml.safe_load(open(perm))["rules"]
+        check("upgrade: the rule the pack retired goes, the user's rule stays, a pack rule the user removed stays out, the rest is there",
+              (0, False, True, False, True, True),
+              (p2.returncode, old_rule in rules2, mine in rules2, sub in rules2,
+               all(r in rules2 for r in pack_rules if r != sub), "removed ask shell retired-tool *" in p2.stdout))
+        with open(conf) as fh:
+            c2 = fh.read()
+        with open(perm) as fh:
+            perm2 = fh.read()
+        p3 = install()
+        check("installing again changes neither file and says so", (c2, perm2, True, True),
+              (open(conf).read(), open(perm).read(), "kiro-guard.conf: up to date" in p3.stdout, "permissions: up to date" in p3.stdout))
 
     os.chdir(HERE)
     shutil.rmtree(tmp, ignore_errors=True)

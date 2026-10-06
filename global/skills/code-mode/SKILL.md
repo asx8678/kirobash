@@ -21,8 +21,9 @@ EOF
 - First line: the question the program answers. Last lines: findings only (one per line, or a small JSON/table, or counts). Aim under 50 lines of output; 250 lines is the cap (`--lines N` to change it) and the full output stays in `.kiro/scratch/*.out` to grep.
 - One result holds about 28,000 characters. A longer one (a deliberate `kt.read`) comes in parts: part 1 ends with the `kiro-run --more ID N` calls for the others. Issue them all together in one step and read every part before concluding.
 - Answer the whole question in one run: several checks in one program beat several programs.
-- Let the first exception surface (its traceback is the debugging information); no blanket `try/except: pass`.
-- Options go first: `--bash`, `--timeout 300`, `--lines N`, `--raw`. A saved program runs as `kiro-run file.py args`. The default timeout is 100 s, just under the 120 s after which Kiro kills a shell call; with a longer `--timeout`, give the shell tool call the same timeout.
+- Let the first exception surface (its traceback is the debugging information); no blanket `try/except: pass`. A failed program shows its start, its last 60 lines, its exit code and the files it changed before failing: read the saved output (`kt.show`, `grep`) instead of running it again, and check those files before a re-run. A bash program with a syntax error runs nothing (exit 65).
+- Options go first: `--bash`, `--timeout 300`, `--lines N`, `--raw`. A saved program runs as `kiro-run file.py args`. The default timeout is 100 s, just under the 120 s after which Kiro kills a shell call; with a longer `--timeout`, give the shell tool call the same timeout. Processes a program leaves running are stopped when it ends.
+- Work longer than one call (a full test suite, `terraform plan`, a slow fan-out): `kiro-run --bg --timeout 1800 <<'EOF'` starts it detached (same checks, at most 3600 s, 4 jobs) and prints its id. Do other work, then `kiro-run --wait ID` (up to 100 s per call; it prints the new output, masked, and the exit code once it ended); `kiro-run --jobs` lists them, `kiro-run --stop ID` ends one. Nothing wakes you when a job ends: wait for it explicitly, never in a sleep loop.
 
 ## kt: helpers every program can import
 They cap what they print and keep secrets out of it. Each prints its findings and returns the data, so call them bare (`kt.tree()`, not `print(kt.tree())`); pass `quiet=True` to get only the data.
@@ -41,6 +42,7 @@ They cap what they print and keep secrets out of it. Each prints its findings an
 | `kt.outline("internal/**/*.go")` | functions, types, resources with line numbers |
 | `kt.show("path", 120, 160)` or `kt.show("path", around=140)` | numbered lines of a range (the whole file, up to 400 lines, without one); a secrets file comes with every value masked |
 | `kt.sh("go vet ./...", tail=40)` | exit code and the last lines of a command; returns `(rc, output)` |
+| `kt.partition(parts=4)` | the project split into at most `parts` non-overlapping folder groups by line count, for handing work too large for one context to scouts (large-task skill) |
 
 In a bash program the same helpers are commands: `kt survey`, `kt read 'src/**' max_lines=800`, `kt grep 'regex' '**/*.go' ctx=1`, `kt show path 120 160`, and `kt.sh "cmd"`, which runs the command with a 60-second limit and prints all of its output (so you can pipe it into `grep`). Python syntax such as `kt.sh("...")` is a syntax error in a bash program.
 
@@ -175,3 +177,6 @@ EOF
 - Outside a program nothing masks. So the guard sends the read tool, the search tool and a direct `cat`, `head` or `grep` through `kiro-run` whenever what they would return holds a secret value; its message contains the program to run (`kt.read`, `kt.grep`, or the same command). Everything else is read and searched as usual.
 - `kiro-run` refuses a program that really runs a cluster or cloud command (`kubectl`, `helm list`, `az`, `aws`, boto3 ...) while no read-only credentials are active. Folder names such as `helm/` and local commands such as `helm lint`, `helm template` or `az bicep build` are fine. The refusal names the command: take it out, run the rest of the program again, and issue that command alone as a direct call. Tell the user once that `kiro-safe` enables the fan-out patterns.
 - A refusal or a block concerns one step. It is never a reason to drop code mode for the rest of the task, and never something to work around.
+- `KIRO_*` variables and `HOME` configure the guard and the runner: only the user sets them, and the guard blocks a command that does.
+- The same program on an unchanged workspace is refused after five runs in a row (exit 76): re-running identical code adds no information, so change the program or report what you know. A program that prints more than 20 MB is stopped: print findings, not raw data. A `[kiro-run hint: …]` line after a failure names the allowed way forward.
+- When the user turned on the sandbox (`RUN_SANDBOX` in kiro-guard.conf, a `· sandbox` mark in the banner), a program can write only inside the project (not `.git` or `.kiro`, except `.kiro/scratch`) and `/tmp`, and has no network unless its cloud commands run with read-only credentials. A "Read-only file system" or "Operation not permitted" error comes from the sandbox: take that step out and issue it as a direct command.

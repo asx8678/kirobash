@@ -61,9 +61,9 @@ rules:
     effect: deny
   - capability: web_fetch
     effect: allow
-  # the pack's helpers (fact-check: web lookups; scout and skeptic: read-only) run without a prompt
+  # the pack's helpers (fact-check: web lookups; scout, skeptic and auditor: read-only) run without a prompt
   - capability: subagent
-    match: ["fact-check", "scout", "skeptic"]
+    match: ["fact-check", "scout", "skeptic", "auditor"]
     effect: allow
   - capability: skill
     effect: allow
@@ -197,6 +197,24 @@ rules:
       - "*rm -rf /"
       - "*rm -rf ~*"
       - "*rm -rf $HOME*"
+      # Kiro itself: another session with trusted tools, or a changed Kiro setting / agent / MCP server
+      # (KIRO_* variables configure the guard and kiro-run; only the user sets them)
+      - "*kiro-cli*--trust*"
+      - "*qchat*--trust*"
+      - "q chat*--trust*"
+      - "*kiro-cli settings * *"
+      - "*kiro-cli settings --delete*"
+      - "*kiro-cli agent create*"
+      - "*kiro-cli agent edit*"
+      - "*kiro-cli agent set-default*"
+      - "*kiro-cli agent import*"
+      - "*kiro-cli agent migrate*"
+      - "*kiro-cli mcp add*"
+      - "*kiro-cli mcp remove*"
+      - "*kiro-cli mcp import*"
+      - "KIRO_*=*"
+      - "*export KIRO_*"
+      - "*env KIRO_*=*"
     effect: deny
 
   # ---------------------------------------------------------------- k8s destructive: ask
@@ -222,6 +240,14 @@ rules:
   # ---------------------------------------------------------------- mutating: ask
   - capability: shell
     match:
+      # another Kiro (or Amazon Q) agent session, started by the agent
+      - "kiro-cli"
+      - "kiro-cli chat*"
+      - "kiro-cli translate*"
+      - "kiro-cli login*"
+      - "kiro-cli update*"
+      - "q chat*"
+      - "qchat*"
       - "*kubectl apply*"
       - "*kubectl * apply *"
       - "*kubectl create *"

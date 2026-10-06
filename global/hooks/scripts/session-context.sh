@@ -19,9 +19,13 @@ if have aws; then
   echo "aws: ${arn}${AWS_CONFIG_FILE:+ config=$AWS_CONFIG_FILE}"
   case "${AWS_CONFIG_FILE:-}" in *kiro*) ro="$ro aws";; esac
 fi
-mode="$(sed -n 's/^GUARD_MODE=//p' "$HOME/.kiro/hooks/scripts/kiro-guard.conf" 2>/dev/null)"
-echo "kiro-guard: ${mode:-destructive} mode; read-only credentials:${ro:- NONE (admin credentials in use — prepare changes, do not run them)}"
-cm="$(sed -n 's/^CODE_MODE=//p' "$HOME/.kiro/hooks/scripts/kiro-guard.conf" 2>/dev/null)"; cm="${KIRO_CODE_MODE:-${cm:-enforce}}"
+# the guard's effective settings (validated; the environment can only tighten them)
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+conf() { python3 "$here/kiro_guard.py" --conf-get "$1" 2>/dev/null || echo "$2"; }
+mode="$(conf GUARD_MODE destructive)"
+sb="$(conf RUN_SANDBOX off)"; [ "$sb" = off ] && sb="" || sb="; kiro-run sandbox: $sb"
+echo "kiro-guard: ${mode} mode${sb}; read-only credentials:${ro:- NONE (admin credentials in use — prepare changes, do not run them)}"
+cm="$(conf CODE_MODE enforce)"
 case "$cm" in
   enforce) echo "code mode: enforced — one command per direct shell call; several commands, a loop or inline code go in one program: kiro-run --bash <<'EOF' ... EOF (python without --bash; import kt)" ;;
   inline)  echo "code mode: inline code (python3 -c, bash -c, heredocs into interpreters) goes through kiro-run <<'EOF' ... EOF" ;;

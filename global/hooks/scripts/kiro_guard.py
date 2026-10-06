@@ -33,14 +33,33 @@ CONF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kiro-guard
 
 
 # ----------------------------------------------------------------- config ---
+# Settings that protect something, weakest value first. A value that is not on its list counts as the
+# strictest one, and the environment (KIRO_<NAME>) can only move a setting toward the strict end: a typo
+# or a variable set for a nested process never weakens the guard. kiro-run reads the RUN_* settings
+# through `kiro_guard.py --conf-get NAME`, so both apply the same rules.
+LEVELS = {
+    "GUARD_MODE": ("off", "destructive", "readonly"),
+    "CODE_MODE": ("off", "prefer", "inline", "enforce"),
+    "SECRET_READS": ("off", "mask"),
+    "RUN_SANDBOX": ("off", "auto", "require"),      # kiro-run: run programs in an OS sandbox
+    "RUN_SANDBOX_NET": ("allow", "deny"),           # kiro-run: network inside the sandbox
+    "RUN_ALLOW_ADMIN": ("1", "0"),                  # kiro-run: 1 = run cloud programs without read-only credentials
+}
+CONF_DEFAULTS = {
+    "GUARD_MODE": "destructive",
+    "CODE_MODE": "enforce",
+    "SECRET_READS": "mask",
+    "RUN_SANDBOX": "off",
+    "RUN_SANDBOX_NET": "deny",
+    "RUN_ALLOW_ADMIN": "0",
+    "LOCAL_CONTEXTS": r"kind-.*|minikube|docker-desktop|docker-for-desktop|rancher-desktop|orbstack|k3d-.*|colima.*|microk8s",
+    "LOG_FILE": os.path.join(HOME, ".kiro", "kiro-guard.log"),
+}
+CONF_PROBLEMS = []   # ("FAIL" | "WARN", message): reported by `kiro_guard.py --check-conf` (kiro-doctor)
+
+
 def load_conf():
-    conf = {
-        "GUARD_MODE": "destructive",  # destructive | readonly | off
-        "CODE_MODE": "enforce",       # enforce (inline code and multi-command lines go through kiro-run) | inline | prefer | off
-        "SECRET_READS": "mask",       # mask (a read that would show a secret value goes through kiro-run, which masks it) | off
-        "LOCAL_CONTEXTS": r"kind-.*|minikube|docker-desktop|docker-for-desktop|rancher-desktop|orbstack|k3d-.*|colima.*|microk8s",
-        "LOG_FILE": os.path.join(HOME, ".kiro", "kiro-guard.log"),
-    }
+    conf = dict(CONF_DEFAULTS)
     try:
         with open(CONF_PATH, encoding="utf-8") as fh:
             for line in fh:
@@ -48,15 +67,42 @@ def load_conf():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                conf[k.strip()] = v.strip().strip('"').strip("'")
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k in LEVELS:
+                    if v.lower() not in LEVELS[k]:
+                        CONF_PROBLEMS.append(("FAIL", "%s=%s is not one of %s: using %s, the strictest"
+                                              % (k, v, "|".join(LEVELS[k]), LEVELS[k][-1])))
+                        v = LEVELS[k][-1]
+                    conf[k] = v.lower()
+                elif k in conf:
+                    conf[k] = v
+                else:
+                    CONF_PROBLEMS.append(("WARN", "unknown setting %s (ignored)" % k))
     except OSError:
         pass
-    # The person launching Kiro may override via environment (the agent cannot
-    # change the environment of the Kiro process that runs this hook).
-    for k in ("GUARD_MODE", "CODE_MODE", "SECRET_READS", "LOCAL_CONTEXTS", "LOG_FILE"):
-        env = os.environ.get("KIRO_" + k)
-        if env:
+    # The person launching Kiro may tighten a setting through the environment (KIRO_GUARD_MODE=readonly
+    # kiro-safe); loosening it takes an edit of the file, which the agent cannot make.
+    for k, levels in LEVELS.items():
+        env = (os.environ.get("KIRO_" + k) or "").strip().lower()
+        if not env:
+            continue
+        if env not in levels:
+            CONF_PROBLEMS.append(("FAIL", "KIRO_%s=%s is not one of %s: using %s" % (k, env, "|".join(levels), levels[-1])))
+            env = levels[-1]
+        if levels.index(env) > levels.index(conf[k]):
             conf[k] = env
+        elif env != conf[k]:
+            CONF_PROBLEMS.append(("WARN", "KIRO_%s=%s ignored: the environment can only make a setting stricter "
+                                  "(set it in kiro-guard.conf)" % (k, env)))
+    if os.environ.get("KIRO_LOCAL_CONTEXTS"):
+        CONF_PROBLEMS.append(("WARN", "KIRO_LOCAL_CONTEXTS ignored: local contexts are set in kiro-guard.conf only"))
+    if os.environ.get("KIRO_LOG_FILE"):
+        conf["LOG_FILE"] = os.environ["KIRO_LOG_FILE"]
+    try:
+        re.compile(conf["LOCAL_CONTEXTS"])
+    except re.error:
+        CONF_PROBLEMS.append(("FAIL", "LOCAL_CONTEXTS is not a valid regular expression: no context counts as local"))
+        conf["LOCAL_CONTEXTS"] = r"(?!)"
     conf["LOG_FILE"] = os.path.expanduser(conf["LOG_FILE"])
     return conf
 
@@ -206,14 +252,27 @@ RAW_D_PATTERNS = [
 ]
 RAW_D = [(re.compile(p, re.I if "Az" not in p else 0), why) for p, why in RAW_D_PATTERNS]
 
-# Tool ids the Kiro v3 engine passes to PreToolUse hooks as tool_name.
-BUILTIN_TOOLS = {"read_file", "list_directory", "file_search", "grep_search", "read_code", "get_diagnostics",
-                 "fs_write", "fs_append", "str_replace", "delete_file", "edit_code", "semantic_rename",
-                 "smart_relocate", "execute_bash", "execute_pwsh", "control_bash_process", "control_pwsh_process",
-                 "list_processes", "get_process_output", "web_fetch", "remote_web_search", "invoke_sub_agent",
-                 "orchestrate_subagent", "disclose_context", "kiro_powers", "knowledge", "introspect", "code",
-                 "tool_search", "todo"}
-WRITE_TOOLS = {"fs_write", "fs_append", "str_replace", "delete_file", "edit_code", "smart_relocate"}
+# Tool ids the Kiro v3 engine passes to PreToolUse hooks as tool_name, from the tool-to-capability map of
+# Kiro CLI 2.27.1 (@kiro/agent acp-server.js), lower-cased as the dispatcher compares them; the engine also
+# knows camelCase spellings (fsWrite, strReplace ...), which lower-case to the second spelling here.
+FS_READ_TOOLS = {"read_file", "read_files", "list_directory", "file_search", "grep_search", "read_code", "read", "glob",
+                 "grep", "code", "analyze_requirements", "fs_read", "read_multiple_files", "readfile",
+                 "readmultiplefiles", "listdirectory", "filesearch", "grepsearch", "readcode", "get_diagnostics",
+                 "getdiagnostics"}
+WRITE_TOOLS = {"fs_write", "fs_append", "str_replace", "delete_file", "write", "edit_code", "semantic_rename",
+               "smart_relocate", "create_hook", "update_pbt_status", "c2s_render_architecture", "fswrite", "fsappend",
+               "strreplace", "deletefile", "editcode", "semanticrename", "smartrelocate", "createhook"}
+SHELL_TOOLS = {"execute_bash", "execute_pwsh", "run_command", "shell", "control_bash_process", "control_pwsh_process",
+               "control_process", "executebash", "executepwsh", "runcommand", "controlbashprocess",
+               "controlpwshprocess", "controlprocess", "list_processes", "get_process_output"}
+BUILTIN_TOOLS = FS_READ_TOOLS | WRITE_TOOLS | SHELL_TOOLS | {
+    "web_fetch", "web_search", "remote_web_search", "webfetch", "websearch", "invoke_sub_agent", "orchestrate_subagent",
+    "delegate", "invokesubagent", "subagent_response", "disclose_context", "disclosecontext", "kiro_powers",
+    "kiropowers", "knowledge", "introspect", "tool_search", "todo", "todo_list", "thinking", "report_progress",
+    "use_aws", "use_subagent", "report_issue", "get_learnings", "get_learning", "create_feedback_learning",
+    "delete_learning", "get_learnings_for_prompt", "get_steering_files", "searchmemories", "verify_requirements",
+    "validate_spec_format", "remote_tool"}
+MCP_NAME_RE = re.compile(r"___|^mcp[_.-]|^@|/")       # server___tool, mcp_..., @server/tool: named by an MCP server
 MCP_D_NAME = re.compile(r"(delete|destroy|purge|uninstall|drain|deallocate|remove|wipe|terminate)", re.I)
 MCP_INFRA_NAME = re.compile(r"(k8s|kube|pod|namespace|node|helm|deploy|aks|azure|azmcp|^az_|resource|aws|eks|ec2|"
                             r"s3|rds|iam|lambda|cloudformation|cfn|dynamo|ecs|ecr|sqs|sns|kms|secret|"
@@ -315,11 +374,22 @@ CODE_KIRO_RE = re.compile(r"\.kiro['\"/\\, +)]*\s*['\"]?/?(hooks|settings|worksp
                           r"kiro[-_]guard|\.local/bin/kiro-|\.kiroignore\b|kiroignore['\"]")
 
 
+# A program that sets a KIRO_* variable for itself or for a process it starts (os.environ["KIRO_X"] = ..,
+# env={"KIRO_X": ..}, dict(os.environ, KIRO_X=..), process.env.KIRO_X = .., $env:KIRO_X = ..).
+CODE_KIRO_ENV_RE = re.compile(r"""os\.environ\s*\[\s*['"](KIRO_\w*)['"]\s*\]\s*=(?!=)|"""
+                              r"""os\.(?:environ\.(?:update|setdefault)|putenv)\s*\([^)]*?\b(KIRO_\w*)|"""
+                              r"""['"](KIRO_\w*)['"]\s*:|\b(KIRO_\w*)\s*=(?!=)|"""
+                              r"""process\.env(?:\.|\[\s*['"])(KIRO_\w*)['"]?\s*\]?\s*=(?!=)|\$env:(KIRO_\w*)\s*=(?!=)""")
+
+
 def code_scan(text):
     """raw_scan plus access to credential files and to Kiro's own files, for interpreter / PowerShell code."""
     v = raw_scan(text)
     if v:
         return v
+    m = CODE_KIRO_ENV_RE.search(text)
+    if m:
+        return kiro_var_verdict(next(g for g in m.groups() if g))
     if CODE_CRED_RE.search(text):
         return Verdict("D", "code that reads cloud credential files (~/.kube, ~/.azure, ~/.aws)")
     if CODE_KIRO_RE.search(text):
@@ -987,6 +1057,58 @@ def analyze_pkg(tool, args, as_root):
     return None
 
 
+# Kiro itself (and Amazon Q, its predecessor). Another agent session started by the agent would run
+# with whatever trust flags and environment it is given, outside this conversation's prompts, and a
+# changed setting (chat.agentEngine) can switch hooks off for every later session.
+KIRO_CLI_TOOLS = {"kiro-cli", "kiro", "q", "qchat"}
+KIRO_CLI_SUBCMDS = {"chat", "settings", "agent", "mcp", "translate", "login", "logout", "update", "doctor", "whoami",
+                    "version", "help", "diagnostic", "debug", "integrations", "inline", "setup", "init", "hook",
+                    "launch", "quit", "restart", "uninstall", "install", "user", "issue", "theme", "dashboard"}
+KIRO_CLI_READ = {"--version", "-V", "version", "whoami", "doctor", "help", "--help", "-h", "diagnostic", "issue"}
+KIRO_CLI_VALUE_FLAGS = {"--format", "-f", "--agent", "--model", "--profile", "--region"}
+KIRO_TOOLS_CONF = KIRO_CLI_TOOLS | {"kiro-run", "kiro-doctor", "kiro-safe"}   # tools that read ~/.kiro (HOME)
+
+
+def kiro_var_verdict(name):
+    """KIRO_* variables configure kiro-guard, kiro-run and the launchers. The environment can only tighten
+    the guard's settings, but a variable set by the agent for a process it starts is still the agent
+    choosing that process's configuration, so it is refused outright."""
+    return Verdict("D", "setting %s: KIRO_* variables configure kiro-guard and kiro-run, and only the user "
+                   "sets them" % name)
+
+
+def analyze_kiro(tool, args):
+    pos = positional(args, KIRO_CLI_VALUE_FLAGS)
+    sub = pos[0] if pos else ""
+    name = "%s %s" % (tool, sub if sub in KIRO_CLI_SUBCMDS else "")
+    if any(a.startswith("--trust") for a in args):
+        return Verdict("D", "%s with %s: another Kiro session that runs tools without asking"
+                       % (name.strip(), next(a for a in args if a.startswith("--trust")).split("=")[0]))
+    if tool in ("q", "kiro") and sub not in KIRO_CLI_SUBCMDS and not (tool == "q" and not args):
+        return None                 # another program of that name (q: SQL on text files; kiro: the IDE launcher)
+    op = pos[1] if len(pos) > 1 else ""
+    if sub == "settings":
+        if has_flag(args, "--delete", "-d", "--reset") or len(pos) >= 3 or "=" in op:
+            return Verdict("D", "%s settings %s: changes a Kiro setting (one of them decides whether the guard "
+                           "runs at all)" % (tool, op or "--delete"))
+        if op in ("open", "edit"):
+            return Verdict("M", "%s settings %s" % (tool, op))
+        return None
+    if sub == "agent":
+        if op in ("create", "edit", "set-default", "migrate", "import", "delete", "rm", "remove", "update", "set"):
+            return Verdict("D", "%s agent %s: changes the agent configurations Kiro runs" % (tool, op))
+        return None if op in ("", "list", "validate", "schema", "show") else Verdict("M", "%s agent %s" % (tool, op))
+    if sub == "mcp":
+        if op in ("add", "remove", "rm", "import", "edit", "update"):
+            return Verdict("D", "%s mcp %s: changes the MCP servers Kiro starts" % (tool, op))
+        return None if op in ("", "list", "status") else Verdict("M", "%s mcp %s" % (tool, op))
+    if sub in KIRO_CLI_READ or (not sub and args and all(a in KIRO_CLI_READ for a in args)):
+        return None
+    if sub and sub != "chat" and sub != "translate":
+        return Verdict("M", "%s %s" % (tool, sub))
+    return Verdict("M", "%s starts another Kiro agent session" % name.strip())
+
+
 def analyze_env_leak(words):
     if not words:
         return None
@@ -1066,18 +1188,24 @@ def resolve(tok, cwd, base=None):
         t = os.path.join(base or cwd, t)
     t = os.path.normpath(t)
     try:
-        if os.path.lexists(t):
-            t = os.path.realpath(t)
-    except OSError:
+        # symlinks are followed for the part of the path that exists, so a new file under a linked
+        # folder (proj/hk/new.sh with hk -> ~/.kiro/hooks) is judged by where it really lands
+        t = os.path.realpath(t)
+    except (OSError, ValueError):
         pass
     return t
+
+
+WORKSPACE_KIRO_RE = re.compile(r"/\.kiro/(hooks|agents|settings)(/|$)")
 
 
 def path_class(p):
     for d in KIRO_PROTECTED:
         if p == d or p.startswith(d + "/"):
             return "kiro"
-    if "/.kiro/hooks/" in p + "/":
+    # any workspace's hooks, agent configs and settings (permissions, MCP servers) govern the agent too;
+    # its steering, specs and scratch folder stay writable
+    if WORKSPACE_KIRO_RE.search(p):
         return "kiro"
     for d in CRED_DIRS:
         if p == d or p.startswith(d + "/"):
@@ -1155,22 +1283,33 @@ def analyze_segment(seg, cwd, env, depth, force_remote, raw, shell_vars=None):
     if leak:
         return leak
     words = [subst(w, shell_vars, env) for w in seg]
+    if words and words[0] == "unset" and "HOME" in words[1:]:
+        shell_vars["HOME"] = ""
     # assignment-only segment (C=kubectl) or export/declare: remember for later segments
     if words and all(ASSIGN_RE.match(w) for w in words):
         for w in words:
             k, v = w.split("=", 1)
+            if k.startswith("KIRO_"):
+                return kiro_var_verdict(k)
             shell_vars[k] = v
         return None
     if words and words[0] in ("export", "declare", "typeset", "local", "readonly"):
         for w in words[1:]:
+            k = w.split("=", 1)[0]
+            if k.startswith("KIRO_") and not (words[0] == "export" and "-n" in words[1:]):
+                return kiro_var_verdict(k)
             if ASSIGN_RE.match(w):
                 k, v = w.split("=", 1)
                 shell_vars[k] = v
         return None
     # strip leading VAR=value assignments (and remember KUBECONFIG etc.)
+    prefix = set()
     while words and ASSIGN_RE.match(words[0]):
         k, v = words.pop(0).split("=", 1)
+        if k.startswith("KIRO_"):
+            return kiro_var_verdict(k)
         env[k] = v
+        prefix.add(k)
     # strip wrappers
     changed = True
     as_root = False
@@ -1200,8 +1339,15 @@ def analyze_segment(seg, cwd, env, depth, force_remote, raw, shell_vars=None):
                 f = words.pop(0)
                 if "=" in f and not f.startswith("-"):
                     k, v = f.split("=", 1)
+                    if k.startswith("KIRO_"):
+                        return kiro_var_verdict(k)
                     env[k] = v
+                    prefix.add(k)
+                elif w == "env" and f in ("-i", "-", "--ignore-environment"):
+                    prefix.add("HOME")                  # an empty environment has no HOME either
                 elif f in vf and words:
+                    if w == "env" and f in ("-u", "--unset") and words[0] == "HOME":
+                        prefix.add("HOME")
                     words.pop(0)
             changed = True
     if not words:
@@ -1211,6 +1357,8 @@ def analyze_segment(seg, cwd, env, depth, force_remote, raw, shell_vars=None):
         return None
     tool = norm_tool(words[0])
     args = words[1:]
+    if tool in KIRO_TOOLS_CONF and ("HOME" in prefix or "HOME" in shell_vars):
+        return Verdict("D", "%s with a different HOME: it would read another kiro-guard.conf and Kiro settings" % tool)
 
     pv = protected_access(tool, args, redirs, cwd)
     if pv:
@@ -1249,8 +1397,9 @@ def analyze_segment(seg, cwd, env, depth, force_remote, raw, shell_vars=None):
         opts, rest, i = [], [], 0
         while i < len(args):                      # options come before the program file; the rest are its args
             a = args[i]
-            if a == "--more":                     # prints a saved part of an earlier run's output: nothing runs
-                return None
+            if a in ("--more", "--wait", "--stop", "--jobs"):
+                return None                       # an earlier run's output part, or a background job's
+                                                  # status/stop: nothing new runs (--bg is a plain option)
             if a in ("--timeout", "--lines") and i + 1 < len(args):
                 i += 2
                 continue
@@ -1371,6 +1520,8 @@ def analyze_segment(seg, cwd, env, depth, force_remote, raw, shell_vars=None):
         v = analyze_gcloud(tool, args)
     elif tool.startswith("ansible"):
         v = analyze_ansible(tool, args, cwd, env, depth)
+    elif tool in KIRO_CLI_TOOLS:
+        v = analyze_kiro(tool, args)
     elif tool in SYSTEM_D or tool in ("systemctl", "service", "rc-service", "launchctl", "dd", "init", "kill", "pkill",
                                       "killall", "chmod", "chown", "chgrp") or tool.startswith("mkfs"):
         v = analyze_system(tool, args, cwd)
@@ -1401,7 +1552,8 @@ CODE_CMD_TOOLS = KNOWN_TOOLS | DB_TOOLS | PKG_MANAGERS | SHELLS | {
     "git", "gh", "docker", "podman", "nerdctl", "docker-compose", "ssh", "scp", "sftp", "rsync", "sudo", "doas",
     "npm", "yarn", "pnpm", "pip", "pip3", "pipx", "twine", "cargo", "gem", "systemctl", "service", "crontab",
     "gcloud", "gsutil", "ansible", "ansible-playbook", "env", "printenv", "chmod", "chown", "kill", "pkill",
-    "killall", "dd", "iptables", "fly", "flyctl", "vercel", "netlify", "wrangler", "vagrant", "minikube", "kind", "k3d"}
+    "killall", "dd", "iptables", "fly", "flyctl", "vercel", "netlify", "wrangler", "vagrant", "minikube", "kind", "k3d",
+    "kiro-cli", "kiro", "q", "qchat", "kiro-run", "kiro-doctor", "kiro-safe"}
 TRIVIAL_CMDS = {"cd", "pushd", "popd", "echo", "printf", "true", ":", "set", "export", "unset", "sleep", "wait",
                 "source", ".", "umask", "shopt", "alias", "local", "declare", "readonly", "typeset", "exit",
                 "return", "test", "["}
@@ -1653,7 +1805,7 @@ def cloud_use(text, kind="shell", cwd=".", depth=0):
 def kiro_run_would_refuse(text, env, cwd="."):
     """True when kiro-run would refuse a program made of this text: it really uses a cloud CLI/SDK and
     the read-only credentials for that cloud are not active."""
-    if env.get("KIRO_RUN_ALLOW_ADMIN") == "1":
+    if CONF["RUN_ALLOW_ADMIN"] == "1":
         return False
     return any(CLOUD_ENV[c][1] not in env.get(CLOUD_ENV[c][0], "") for c in cloud_use(text, "shell", cwd))
 
@@ -1841,8 +1993,9 @@ def analyze_command(cmd, cwd, env, depth=0, force_remote=False):
 # a direct `cat` or `grep`, would hand the same values to the model as they are. Such a call is sent
 # through kiro-run instead (kt.show / kt.read / kt.grep, or the same command), where the masking
 # applies: the read still happens, the value never reaches the conversation.
-READ_TOOLS = {"read_file", "read_code", "fs_read", "read_multiple_files"}
-SEARCH_TOOLS = {"grep_search"}
+READ_TOOLS = {"read_file", "read_files", "read_code", "read", "fs_read", "read_multiple_files", "readfile",
+              "readmultiplefiles", "readcode"}
+SEARCH_TOOLS = {"grep_search", "grepsearch"}
 READER_CMDS = {"cat", "head", "tail", "less", "more", "bat", "batcat", "nl", "tac", "sed", "awk", "gawk", "cut", "sort",
                "uniq", "jq", "yq", "xmllint", "strings", "base64", "xxd", "od", "hexdump", "diff", "paste", "column",
                "fold", "rev", "expand", "pr"}
@@ -2123,29 +2276,109 @@ def decide(v):
     return False, ""
 
 
+# The audit log keeps what was decided and why, never a secret: a command can carry one (a token in a
+# push URL, --from-literal=password=...). The masking filter kiro-run uses runs first; these two patterns
+# are the floor when it cannot be loaded.
+LOG_MASKS = (
+    (re.compile(r"([A-Za-z][\w+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[redacted]@"),
+    (re.compile(r"(?i)([\w.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|credential|private[_-]?key)[\w.-]*"
+                r"[\"']?\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s'\",;]+)"), r"\1[redacted]"),
+)
+
+
+def mask_for_log(text):
+    libs = secret_libs()
+    if libs:
+        try:
+            text = libs[1].redact(text)[0]
+        except Exception:
+            pass
+    for rx, rep in LOG_MASKS:
+        text = rx.sub(lambda m: m.group(0) if "[redacted]" in m.group(0) else m.expand(rep), text)
+    return text
+
+
 def log(decision, tool, cmd, why):
     try:
+        line = "%s\t%s\t%s\t%s\t%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), decision, tool,
+                                       mask_for_log(why).replace("\n", " "),
+                                       mask_for_log(cmd).replace("\n", "\\n")[:400])
         os.makedirs(os.path.dirname(CONF["LOG_FILE"]), exist_ok=True)
         with open(CONF["LOG_FILE"], "a", encoding="utf-8") as fh:
-            fh.write("%s\t%s\t%s\t%s\t%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), decision, tool,
-                                                why, cmd.replace("\n", "\\n")[:400]))
+            fh.write(line)
     except OSError:
         pass
 
 
 # ------------------------------------------------------------------ main ---
+# the path parameters of Kiro's file tools (2.27.1), one file or a list
+PATH_PARAMS = ("path", "file", "filePath", "file_path", "relativePath", "targetFile", "sourcePath", "destinationPath",
+               "workspacePath", "steeringFile", "workflowPath")
+PATH_LIST_PARAMS = ("paths", "files", "filePaths", "file_paths")
+PATH_KEY_RE = re.compile(r"(path|file|dir|directory|folder|target|destination|source|location)s?$", re.I)
+
+
 def collect_paths(ti):
     paths = []
-    for k in ("path", "targetFile", "sourcePath", "destinationPath"):
+    for k in PATH_PARAMS:
         if isinstance(ti.get(k), str):
             paths.append(ti[k])
+    for k in PATH_LIST_PARAMS:
+        if isinstance(ti.get(k), list):
+            paths += [p for p in ti[k] if isinstance(p, str)]
     for op in ti.get("operations") or []:
         if isinstance(op, dict) and isinstance(op.get("path"), str):
             paths.append(op["path"])
     return paths
 
 
+def guess_paths(ti, depth=0):
+    """Paths in the input of a tool whose parameters the guard does not know: a value under a key that
+    names a path, file or folder, or a value that is itself one absolute or home-relative path."""
+    found = []
+    items = ti.items() if isinstance(ti, dict) else enumerate(ti) if isinstance(ti, list) else ()
+    for k, v in items:
+        if isinstance(v, str):
+            one = v.strip()
+            if not one or "\n" in one or len(one) > 4096:
+                continue
+            if (isinstance(k, str) and PATH_KEY_RE.search(k)) or \
+                    (not re.search(r"\s", one) and one.startswith(("/", "~", "$HOME", "${HOME}"))):
+                found.append(one)
+        elif depth < 3 and isinstance(v, (dict, list)):
+            found += guess_paths(v, depth + 1)
+    return found
+
+
+def log_unknown_tool(tool):
+    """One UNKNOWN-TOOL line per tool name per day: kiro-doctor lists them, since a tool the guard does not
+    know may be a renamed file tool whose writes it would otherwise not see."""
+    today = time.strftime("%Y-%m-%d")
+    try:
+        with open(CONF["LOG_FILE"], "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 65536))
+            tail = fh.read().decode("utf-8", "replace")
+        if any(ln.startswith(today) and ("\tUNKNOWN-TOOL\t%s\t" % tool) in ln for ln in tail.splitlines()):
+            return
+    except OSError:
+        pass
+    log("UNKNOWN-TOOL", tool, "", "tool name not known to the guard (paths in its input were checked)")
+
+
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--conf-get":
+        # kiro-run and the hooks ask for the effective value of one setting (validated, env applied)
+        if sys.argv[2] not in CONF:
+            sys.stderr.write("kiro-guard: no setting %s\n" % sys.argv[2])
+            return 64
+        sys.stdout.write(CONF[sys.argv[2]] + "\n")
+        return 0
+    if len(sys.argv) >= 2 and sys.argv[1] == "--check-conf":
+        # kiro-doctor: one line per problem; exit 1 when a value was invalid (it then acts as the strictest)
+        for level, msg in CONF_PROBLEMS:
+            sys.stdout.write("%s\t%s\n" % (level, msg))
+        return 1 if any(level == "FAIL" for level, _ in CONF_PROBLEMS) else 0
     if len(sys.argv) >= 2 and sys.argv[1] == "--cloud-use":
         # kiro-run asks which clouds a program uses: one line per cloud, "<cloud>\t<command or call seen>"
         kind = sys.argv[2] if len(sys.argv) > 2 else "shell"
@@ -2174,11 +2407,26 @@ def main():
 
     # 1. writes to guard / settings / credential files
     if tl in WRITE_TOOLS:
-        for p in collect_paths(ti):
+        for p in dict.fromkeys(collect_paths(ti) + guess_paths(ti)):
             if path_class(resolve(p, cwd)):
-                msg = ("BLOCKED by kiro-guard: writing %s is not allowed (Kiro guard, settings or cloud "
-                       "credentials). Ask the user to make this change." % p) + must_see("writing %s" % p)
+                msg = ("BLOCKED by kiro-guard: writing %s is not allowed (Kiro guard, agent configs, settings or "
+                       "cloud credentials). Ask the user to make this change." % p) + must_see("writing %s" % p)
                 log("BLOCK", tool, p, "protected path")
+                sys.stderr.write(msg + "\n")
+                return 2
+
+    # 1a. any other tool that is not a plain read or a shell (those are judged by what they read or run):
+    # its paths get the same protection, so a file tool Kiro renames, a new one, or an MCP server's tool
+    # cannot write the guard, the agent configs or the credentials unseen
+    elif tl not in FS_READ_TOOLS and tl not in SHELL_TOOLS:
+        if tl and tl not in BUILTIN_TOOLS and not MCP_NAME_RE.search(tool):
+            log_unknown_tool(tool)
+        for p in dict.fromkeys(collect_paths(ti) + guess_paths(ti)):
+            if path_class(resolve(p, cwd)):
+                msg = ("BLOCKED by kiro-guard: tool '%s' names %s, which is protected (Kiro guard, agent configs, "
+                       "settings or cloud credentials). Ask the user to make this change." % (tool, p)) + \
+                    must_see("tool '%s' on %s" % (tool, p))
+                log("BLOCK", tool, p, "protected path in the input of tool %s" % tool)
                 sys.stderr.write(msg + "\n")
                 return 2
 

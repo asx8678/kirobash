@@ -272,6 +272,51 @@ BLOCK = [
     "kiro-run cleanup.sh",
     "kiro-run nuke.py",
     "echo aW1wb3J0IG9z | base64 -d | kiro-run",
+    # --- Kiro itself: a second session with the guard off or trusted tools, changed Kiro settings ---
+    'KIRO_GUARD_MODE=off kiro-cli chat --no-interactive --trust-all-tools "delete things"',
+    "kiro-cli chat --trust-all-tools 'fix the build'",
+    "~/.local/bin/kiro-cli chat --no-interactive --trust-all-tools x",
+    "q chat --trust-tools=fs_read,execute_bash 'x'",
+    "qchat chat --trust-all-tools",
+    "kiro-cli settings chat.agentEngine v2",
+    "kiro-cli settings --delete chat.agentEngine",
+    "kiro-cli agent create helper",
+    "kiro-cli agent set-default helper",
+    "kiro-cli mcp add --name x --command /tmp/x",
+    "bash -c 'kiro-cli settings chat.agentEngine v2'",
+    "kiro-run --bash <<'EOF'\nKIRO_GUARD_MODE=off kiro-cli chat --no-interactive --trust-all-tools 'x'\nEOF",
+    "kiro-run --bash <<'EOF'\nkiro-cli settings chat.agentEngine v2\nEOF",
+    "kiro-run <<'EOF'\nimport subprocess, os\nsubprocess.run(['kiro-cli', 'chat', '--no-interactive', '--trust-all-tools', 'x'], env={**os.environ, 'KIRO_GUARD_MODE': 'off'})\nEOF",
+    "kiro-run <<'EOF'\nimport subprocess\nsubprocess.run('kiro-cli settings chat.agentEngine v2', shell=True)\nEOF",
+    # --- KIRO_* variables configure the guard and kiro-run: only the user sets them ---
+    "KIRO_RUN_ALLOW_ADMIN=1 kiro-run --bash <<'EOF'\nkubectl get pods -A\nEOF",
+    "KIRO_LIB=/tmp/fake kiro-run <<'EOF'\nprint(open('.env').read())\nEOF",
+    "KIRO_GUARD_PY=/tmp/fake.py kiro-run <<'EOF'\nprint(1)\nEOF",
+    "env KIRO_LIB=/tmp kiro-run --bash <<'EOF'\nls\nEOF",
+    "export KIRO_GUARD_MODE=off",
+    "declare -x KIRO_SECRET_READS=off",
+    "KIRO_CODE_MODE=off; python3 -c 'print(1)'",
+    "kiro-run <<'EOF'\nimport os\nos.environ['KIRO_RUN_ALLOW_ADMIN'] = '1'\nos.system('kiro-run x.py')\nEOF",
+    "kiro-run <<'EOF'\nimport subprocess, os\nsubprocess.run(['kiro-run', 'tool.py'], env=dict(os.environ, KIRO_LIB='/tmp'))\nEOF",
+    "kiro-run <<'EOF'\nimport os\nos.putenv('KIRO_GUARD_MODE', 'off')\nEOF",
+    "node -e \"process.env.KIRO_GUARD_MODE = 'off'\"",
+    # --- a different HOME would make kiro-run and Kiro read another kiro-guard.conf and settings ---
+    "HOME=/tmp/fakehome kiro-run <<'EOF'\nprint(1)\nEOF",
+    "env -i kiro-run <<'EOF'\nprint(1)\nEOF",
+    "env -u HOME kiro-run --jobs",
+    "export HOME=/tmp/x && kiro-cli chat",
+    "unset HOME; kiro-doctor",
+    # --- a workspace's agent configs and settings govern the agent like its hooks ---
+    "cp evil.json .kiro/agents/default.json",
+    "echo '{}' > .kiro/settings/mcp.json",
+    "sed -i 's/deny/allow/' .kiro/settings/permissions.yaml",
+    "rm -rf .kiro/agents",
+    # rules found untested by tests/test_mutations.py
+    'kubectl "$ACTION" deploy api',
+    'az vm "$OP" -n web -g rg',
+    "mysqladmin -u root drop shop",
+    "copilot svc deploy --env prod",
+    "ansible web -m shell -a 'dd if=/dev/zero of=/tmp/fill bs=1M count=10'",
 ]
 
 ALLOW = [
@@ -435,6 +480,26 @@ ALLOW = [
     "kiro-run --timeout 60 --lines 50 <<'EOF'\nimport json, subprocess\nout = subprocess.run(['az', 'vm', 'list', '-o', 'json'], capture_output=True, text=True).stdout\nprint(sum(1 for v in json.loads(out) if not v.get('tags')))\nEOF",
     "kiro-run report.py",
     "kiro-run status.sh",
+    # --- Kiro: reading its version, identity and settings ---
+    "kiro-cli --version",
+    "kiro-cli whoami",
+    "kiro-cli settings chat.agentEngine",
+    "kiro-cli settings list",
+    "kiro-cli agent list",
+    "kiro-cli mcp list",
+    "q 'select c1, count(*) from data.csv group by c1'",
+    "kiro .",
+    "unset KIRO_GUARD_MODE",
+    "echo \"$KIRO_CODE_MODE\"",
+    "HOME=/tmp/x npm test",
+    "cat .kiro/settings/mcp.json",
+    "ls .kiro/agents",
+    # --- background jobs of kiro-run: status, wait and stop run nothing new ---
+    "kiro-run --wait 20261006-101010-4242 30",
+    "kiro-run --wait 20261006-101010-4242",
+    "kiro-run --stop 20261006-101010-4242",
+    "kiro-run --jobs",
+    "kiro-run --bg --timeout 900 <<'EOF'\nimport kt\nkt.tree()\nEOF",
 ]
 
 # Inline programs: redirected to kiro-run when CODE_MODE=enforce (default); allowed when CODE_MODE=prefer
@@ -478,7 +543,7 @@ CLOUD_COMPOUND = [
     ("echo \"=== pods ===\"; kubectl -n app get pods; echo; helm -n app list", {"KUBECONFIG": "/home/x/.kube/kiro-readonly.yaml"}),
     ("az account show; az group list -o table", {"AZURE_CONFIG_DIR": "/home/x/.azure-kiro"}),
     ("aws sts get-caller-identity && aws s3 ls", {"AWS_CONFIG_FILE": "/home/x/.aws-kiro/config"}),
-    ("kubectl get ns && az account show", {"KIRO_RUN_ALLOW_ADMIN": "1"}),
+    ("kubectl get ns && az account show", {"RUN_ALLOW_ADMIN": "1"}),      # a kiro-guard.conf setting
 ]
 
 # One command (however it is decorated) is not a program: allowed under enforce
@@ -508,6 +573,10 @@ SINGLE = [
 # (command, word that must appear in the message)
 PROGRAM_BLOCK = [
     # mutating steps: need approval, which a program cannot ask for
+    ("kiro-run <<'EOF'\nimport subprocess\nsubprocess.run(['kiro-cli', 'chat', 'summarise this'])\nEOF", "approval"),
+    ("kiro-run --bash <<'EOF'\nkiro-cli chat --no-interactive 'x'\nEOF", "approval"),
+    ("kiro-run --bg <<'EOF'\nimport subprocess\nsubprocess.run(['git', 'push', 'origin', 'feature'])\nEOF", "approval"),
+    ("kiro-run --bg --bash <<'EOF'\nkubectl --context aks-prod delete ns prod\nEOF", "BLOCKED"),
     ("kiro-run --bash <<'EOF'\ngit push origin feature\nEOF", "approval"),
     ("kiro-run --bash <<'EOF'\ngit add -A && git commit -m wip && git push origin feature\nEOF", "approval"),
     ("kiro-run <<'EOF'\nimport subprocess\nsubprocess.run(['git', 'push', 'origin', 'feature'])\nEOF", "approval"),
@@ -543,9 +612,13 @@ PROGRAM_BLOCK = [
     ("kiro-run --bash <<'EOF'\necho GUARD_MODE=off >> ~/.kiro/hooks/scripts/kiro-guard.conf\nEOF", "BLOCKED"),
     ("kiro-run --bash <<'EOF'\ncp /tmp/x ~/.local/bin/kiro-run\nEOF", "BLOCKED"),
     ("cp /tmp/kt.py ~/.kiro/lib/kt.py", "BLOCKED"),
+    # the refusal names the step a remote command would take, not only the ssh
+    ("kiro-run --bash <<'EOF'\nssh web1 'kubectl apply -f app.yaml'\nEOF", "kubectl apply"),
 ]
 
 PROGRAM_ALLOW = [
+    "kiro-run <<'EOF'\nimport os\nprint(os.environ.get('KIRO_RUN_CAPFILE'), os.environ.get('HOME'))\nEOF",
+    "kiro-run --bg --timeout 900 --bash <<'EOF'\ngo test ./... 2>&1 | tail -40\nEOF",
     "kiro-run <<'EOF'\nimport kt\nkt.tree()\nkt.outline('internal/**/*.go')\nkt.grep(r'exec\\.Command|os\\.Remove|InsecureSkipVerify', '**/*.go', ctx=1)\nEOF",
     "kiro-run <<'EOF'\nimport kt\nkt.sh(\"go vet ./...\")\nkt.sh([\"go\", \"test\", \"-short\", \"./...\"], tail=30)\nkt.sh('gofmt -l . | head')\nEOF",
     "kiro-run <<'EOF'\nimport subprocess\nfor a in (['git', 'status', '--short'], ['git', 'log', '--oneline', '-5'], ['git', 'diff', '--stat']):\n    print(subprocess.run(a, capture_output=True, text=True).stdout)\nEOF",
@@ -710,6 +783,32 @@ MUTATING = [
     "minikube delete",
     "kind delete cluster",
     "fly deploy",
+    "kiro-cli chat 'summarise the repo'",
+    "kiro-cli",
+    "q chat",
+    # one per rule that only matters in read-only mode or inside a program (killed by tests/test_mutations.py)
+    "kubectl auth reconcile -f rbac.yaml",
+    "az aks command invoke -g rg -n aks",
+    "az rest --method put --url https://management.azure.com/subscriptions/x/resourceGroups/rg?api-version=2021-04-01",
+    "terraform state mv aws_s3_bucket.a aws_s3_bucket.b",
+    "aws iam remove-user-from-group --user-name u --group-name g",
+    "azd up",
+    "pulumi refresh",
+    "flux reconcile kustomization apps",
+    "argocd app sync shop",
+    "argocd app set shop --revision v2",
+    "velero backup create nightly",
+    "kubectx aks-prod",
+    "kubens kube-system",
+    "istioctl install -y",
+    "linkerd upgrade",
+    "azcopy copy ./dist https://acct.blob.core.windows.net/web",
+    "func azure functionapp publish shop-fn",
+    "copilot svc init --name api",
+    "kops edit cluster prod",
+    "systemctl start nginx",
+    "git remote set-url origin git@github.com:o/r.git",
+    "kiro-cli settings open",
 ]
 
 SCRIPTS = {
@@ -721,14 +820,36 @@ SCRIPTS = {
 }
 
 
-def run(cmd, env, cwd, tool="execute_bash", tool_input=None):
+def run(cmd, env, cwd, tool="execute_bash", tool_input=None, guard=None):
     payload = {"hook_event_name": "PreToolUse", "cwd": cwd, "tool_name": tool,
                "tool_input": tool_input if tool_input is not None else {"command": cmd}}
-    p = subprocess.run(["bash", GUARD], input=json.dumps(payload), capture_output=True, text=True, env=env, cwd=cwd)
+    p = subprocess.run(["bash", guard or GUARD], input=json.dumps(payload), capture_output=True, text=True, env=env, cwd=cwd)
     return p.returncode, p.stderr.strip()
 
 
-def main():
+def guard_with(root, **settings):
+    """A copy of the guard whose kiro-guard.conf has these settings (the environment can only tighten
+    a setting, so a looser mode needs its own file). Laid out like ~/.kiro: hooks/scripts next to lib."""
+    d = os.path.join(root, "guard-" + "-".join("%s=%s" % kv for kv in sorted(settings.items())).replace("/", "_"))
+    scripts = os.path.join(d, "hooks", "scripts")
+    if not os.path.isdir(scripts):
+        os.makedirs(scripts)
+        src = os.path.dirname(os.path.abspath(GUARD))
+        for name in ("kiro-guard.sh", "kiro_guard.py"):
+            shutil.copy(os.path.join(src, name), scripts)
+        with open(os.path.join(src, "kiro-guard.conf")) as fh:
+            conf = fh.read()
+        for k, v in settings.items():
+            conf = re.sub(r"(?m)^%s=.*$" % k, "%s=%s" % (k, v), conf) if re.search(r"(?m)^%s=" % k, conf) \
+                else conf + "\n%s=%s\n" % (k, v)
+        with open(os.path.join(scripts, "kiro-guard.conf"), "w") as fh:
+            fh.write(conf)
+        os.symlink(os.path.abspath(os.path.join(src, "..", "..", "lib")), os.path.join(d, "lib"))
+    return os.path.join(scripts, "kiro-guard.sh")
+
+
+def main(fails=None):
+    """Run every check. tests/test_mutations.py passes its own `fails`, which stops the run at the first failure."""
     tmp = tempfile.mkdtemp()
     fakebin = os.path.join(tmp, "bin")
     os.makedirs(fakebin)
@@ -739,16 +860,17 @@ def main():
         with open(os.path.join(tmp, name), "w") as fh:
             fh.write(body)
 
-    base = dict(os.environ, PATH=fakebin + os.pathsep + os.environ["PATH"], HOME=tmp,
-                KIRO_LOG_FILE=os.path.join(tmp, "guard.log"))
-    for k in list(base):
-        if k.startswith(("AWS_", "AZURE_", "KUBECONFIG")):
-            base.pop(k)
+    # the caller's cloud variables and KIRO_* settings stay out: they would change the verdicts
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "AZURE_", "KUBECONFIG", "KIRO_"))}
+    base.update(PATH=fakebin + os.pathsep + os.environ["PATH"], HOME=tmp, KIRO_LOG_FILE=os.path.join(tmp, "guard.log"))
     project = os.path.join(tmp, "project"); os.makedirs(project)
     for name in SCRIPTS:
         shutil.copy(os.path.join(tmp, name), project)
     tmp_home, tmp = tmp, project
-    fails = []
+    fails = [] if fails is None else fails
+
+    def g(**settings):
+        return guard_with(tmp_home, **settings)
 
     def expect(cmd, want_block, env, label, **kw):
         rc, err = run(cmd, env, tmp, **kw)
@@ -767,26 +889,28 @@ def main():
         rc, err = run(c, base, tmp)
         if rc != 2 or "kiro-run" not in err:
             fails.append("redirect/enforce: expected redirect to kiro-run for %r, rc=%s %s" % (c, rc, err[:100]))
-        rc, err = run(c, dict(base, KIRO_CODE_MODE="inline"), tmp)
+        rc, err = run(c, base, tmp, guard=g(CODE_MODE="inline"))
         if rc != 2 or "kiro-run" not in err:
             fails.append("redirect/inline: expected redirect to kiro-run for %r, rc=%s %s" % (c, rc, err[:100]))
-        expect(c, False, dict(base, KIRO_CODE_MODE="prefer"), "redirect/prefer")
+        expect(c, False, base, "redirect/prefer", guard=g(CODE_MODE="prefer"))
     for c in COMPOUND:
         rc, err = run(c, base, tmp)
         if rc != 2 or "kiro-run --bash" not in err:
             fails.append("compound/enforce: expected redirect to kiro-run --bash for %r, rc=%s %s" % (c, rc, err[:100]))
-        expect(c, False, dict(base, KIRO_CODE_MODE="inline"), "compound/inline")
-        expect(c, False, dict(base, KIRO_CODE_MODE="prefer"), "compound/prefer")
+        expect(c, False, base, "compound/inline", guard=g(CODE_MODE="inline"))
+        expect(c, False, base, "compound/prefer", guard=g(CODE_MODE="prefer"))
     for c, creds in CLOUD_COMPOUND:
         expect(c, False, base, "cloud-compound/no read-only creds")
-        rc, err = run(c, dict(base, **creds), tmp)
+        conf = {k: v for k, v in creds.items() if not k.startswith(("KUBECONFIG", "AZURE_", "AWS_"))}
+        env = {k: v for k, v in creds.items() if k not in conf}
+        rc, err = run(c, dict(base, **env), tmp, guard=g(**conf) if conf else None)
         if rc != 2 or "kiro-run --bash" not in err:
             fails.append("cloud-compound/creds active: expected redirect for %r, rc=%s %s" % (c, rc, err[:100]))
     for c in SINGLE:
         expect(c, False, base, "single")
     for c, word in PROGRAM_BLOCK:
         for mode in ("enforce", "prefer"):          # program rules do not depend on CODE_MODE
-            rc, err = run(c, dict(base, KIRO_CODE_MODE=mode), tmp)
+            rc, err = run(c, base, tmp, guard=g(CODE_MODE=mode))
             if rc != 2 or word not in err:
                 fails.append("program-block/%s: expected a block mentioning %r for %r, rc=%s %s" % (mode, word, c, rc, err[:120]))
     for c in PROGRAM_ALLOW:
@@ -906,6 +1030,38 @@ def main():
     for p, want in [("~/.kiro/hooks/evil.json", True), (".kiro/hooks/x.json", True),
                     ("~/.kiro/settings/permissions.yaml", True), ("src/app.py", False)]:
         expect("", want, base, "write-tool", tool="fs_write", tool_input={"path": p, "text": "x"})
+    # a workspace's agent configs and settings are protected like its hooks; steering, specs and scratch are not
+    ws_writes = [(".kiro/agents/default.json", True), (".kiro/settings/mcp.json", True), (".kiro/settings/permissions.yaml", True),
+                 ("~/.kiro/agents/x.json", True), (".kiro/steering/notes.md", False),
+                 (".kiro/specs/checkout/requirements.md", False), (".kiro/scratch/tools/callers.py", False)]
+    for p, want in ws_writes:
+        expect("", want, base, "workspace-kiro", tool="fs_write", tool_input={"command": "create", "path": p, "file_text": "x"})
+    # a folder that is a symlink: what is written through it is judged by where it lands
+    os.makedirs(os.path.join(tmp_home, ".kiro", "hooks"), exist_ok=True)
+    os.makedirs(os.path.join(tmp_home, "plain"), exist_ok=True)
+    os.symlink(os.path.join(tmp_home, ".kiro", "hooks"), os.path.join(tmp, "hk"))
+    os.symlink(os.path.join(tmp_home, "plain"), os.path.join(tmp, "plainlink"))
+    link_checks = [("", True, dict(tool="fs_write", tool_input={"command": "create", "path": "hk/new.sh", "file_text": "x"})),
+                   ("", True, dict(tool="fs_write", tool_input={"command": "create", "path": os.path.join(tmp, "hk", "sub", "x.json"),
+                                                                "file_text": "x"})),
+                   ("cp notes.md hk/new.json", True, {}),
+                   ("", False, dict(tool="fs_write", tool_input={"command": "create", "path": "plainlink/new.txt", "file_text": "x"}))]
+    for c, want, kw in link_checks:
+        expect(c, want, base, "symlinked-folder", **kw)
+    # the audit log never keeps a secret value from a command, with or without the masking library
+    nolib = g(LOCAL_CONTEXTS="nolib-.*")
+    os.unlink(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(nolib))), "lib"))
+    log_checks = []
+    for gsh in (None, nolib):
+        for c, value in [("git push https://deploy:ghp_Q1w2E3r4T5y6U7i8O9p0AsDfGhJkLzXcVbNm@github.com/o/r.git main", "ghp_Q1w2E3r4"),
+                         ("kubectl create secret generic db --from-literal=password=Summer2024x", "Summer2024x")]:
+            logf = os.path.join(tmp_home, "log-%d.log" % len(log_checks))
+            run(c, dict(base, KIRO_LOG_FILE=logf), tmp, guard=gsh)
+            text = open(logf).read() if os.path.exists(logf) else ""
+            log_checks.append(c)
+            if value in text or "[redacted]" not in text or "\t" not in text:
+                fails.append("log: %s the value of %r should be masked in the log, got %r"
+                             % ("without the library," if gsh else "", c, text[-200:]))
     # tool ids and input fields the v3 engine sends to PreToolUse hooks
     conf = "~/.kiro/hooks/scripts/kiro-guard.conf"
     for tool, ti, want in [
@@ -953,7 +1109,7 @@ def main():
         rc, err = run("", base, tmp, tool=tool, tool_input=ti)
         if rc != 2 or piece not in err or sig in err or "abc123456789" in err:
             fails.append("secret-read: expected a redirect naming %r without the value for %s %r, rc=%s %s" % (piece, tool, ti, rc, err[:160]))
-        expect("", False, dict(base, KIRO_SECRET_READS="off"), "secret-read/off", tool=tool, tool_input=ti)
+        expect("", False, base, "secret-read/off", tool=tool, tool_input=ti, guard=g(SECRET_READS="off"))
     for tool, ti in [
         ("read_file", {"path": "notes.md"}),
         ("read_file", {"path": "config/teams.json", "offset": 5, "limit": 3}),       # lines without the secret
@@ -979,6 +1135,46 @@ def main():
     rc, err = run("terraform destroy", base, tmp, tool="execute_bash")
     if rc != 2 or not err.startswith("BLOCKED by kiro-guard"):
         fails.append("block message should be the only stderr output, got rc=%s %r" % (rc, err[:120]))
+    # tools the guard does not know, Kiro 2.27.1 file tools and camelCase spellings: their paths are checked
+    # all the same (a renamed or new file tool must not write the guard, agent configs or credentials unseen)
+    tool_checks = [
+        ("new_file_tool", {"path": "~/.kiro/hooks/x.json", "content": "x"}, True),
+        ("new_file_tool", {"target": "~/.kube/config"}, True),
+        ("new_file_tool", {"spec": {"output_file": "~/.aws/credentials"}}, True),
+        ("new_file_tool", {"args": ["~/.kiro/settings/permissions.yaml"]}, True),
+        ("new_file_tool", {"file_path": "notes/new.md", "content": "the context is in ~/.kube/config"}, False),
+        ("new_file_tool", {"path": "src/app.py"}, False),
+        ("fsWrite", {"path": "~/.kiro/settings/x.yaml", "text": "x"}, True),
+        ("write", {"path": ".kiro/agents/x.json", "content": "{}"}, True),
+        ("create_hook", {"path": "~/.kiro/hooks/new.json"}, True),
+        ("semantic_rename", {"path": "~/.kiro/hooks/scripts/kiro_guard.py", "newName": "x"}, True),
+        ("smart_relocate", {"sourcePath": "src/a.py", "destinationPath": "~/.kiro/hooks/a.py"}, True),
+        ("fs_write", {"command": "create", "file": "~/.kiro/agents/y.json", "file_text": "{}"}, True),
+        ("myserver___write_file", {"path": "~/.aws/config", "content": "x"}, True),
+        ("list_directory", {"path": "~/.kiro/hooks"}, False),
+        ("execute_bash", {"command": "ls", "working_dir": "~/.kiro/hooks"}, False),
+        ("orchestrate_subagent", {"task": "x", "stages": [{"name": "a", "role": "scout",
+                                                           "prompt_template": "Look at ~/.kiro/hooks and report"}]}, False),
+        ("kubernetes___pods_list", {"namespace": "default"}, False),
+        ("read_files", {"paths": ["config/teams.json"]}, True),          # a secret value: sent to kt.read
+        ("read_files", {"paths": ["notes.md"]}, False),
+    ]
+    for tool, ti, want in tool_checks:
+        expect("", want, base, "tool-paths/%s" % tool, tool=tool, tool_input=ti)
+    # a tool name the guard does not know is logged once a day (kiro-doctor lists them); built-in and MCP
+    # names are not
+    unk_log = os.path.join(tmp_home, "unknown-tools.log")
+    unk_env = dict(base, KIRO_LOG_FILE=unk_log)
+    for tool, ti in [("new_file_tool", {"path": "src/a.py"}), ("new_file_tool", {"path": "src/b.py"}),
+                     ("kubernetes___pods_list", {}), ("fs_write", {"path": "src/c.py", "text": "x"}), ("todo", {})]:
+        run("", unk_env, tmp, tool=tool, tool_input=ti)
+    unk = [ln.split("\t") for ln in open(unk_log).read().splitlines()] if os.path.exists(unk_log) else []
+    unk = [f[2] for f in unk if len(f) > 2 and f[1] == "UNKNOWN-TOOL"]
+    for label, ok in [("an unknown tool is logged as UNKNOWN-TOOL", "new_file_tool" in unk),
+                      ("once a day", unk.count("new_file_tool") == 1),
+                      ("MCP and built-in tools are not", unk == ["new_file_tool"])]:
+        if not ok:
+            fails.append("unknown-tool log: %s (got %r)" % (label, unk))
     # MCP tools with AWS names
     expect("", True, base, "mcp", tool="awslabs___eks_delete_cluster", tool_input={})
     expect("", True, base, "mcp", tool="aws_s3_delete_object", tool_input={})
@@ -992,7 +1188,38 @@ def main():
     expect("cat $KUBECONFIG", True, dict(base, KUBECONFIG=os.path.join(tmp_home, ".kube", "config")), "env-var")
     expect("cat \"$KUBECONFIG\"", True, dict(base, KUBECONFIG=os.path.join(tmp_home, ".kube", "config")), "env-var")
     # guard off
-    expect("kubectl delete pod x", False, dict(base, KIRO_GUARD_MODE="off"), "off")
+    expect("kubectl delete pod x", False, base, "off", guard=g(GUARD_MODE="off"))
+    # settings: the environment only tightens, an invalid value counts as the strictest
+    conf_cases = [
+        ("env cannot turn the guard off", "kubectl delete pod x", True, dict(base, KIRO_GUARD_MODE="off"), None),
+        ("env cannot loosen code mode", "python3 -c 'print(1)'", True, dict(base, KIRO_CODE_MODE="off"), None),
+        ("env can tighten a loose file", "kubectl scale deploy api --replicas=2", True,
+         dict(base, KIRO_GUARD_MODE="readonly"), g(GUARD_MODE="off")),
+        ("values are case-insensitive", "kubectl scale deploy api --replicas=2", True, base, g(GUARD_MODE="Readonly")),
+        ("invalid GUARD_MODE acts as readonly", "kubectl scale deploy api --replicas=2", True, base, g(GUARD_MODE="read-only")),
+        ("invalid SECRET_READS acts as mask", "jq .zuse config/teams.json | cut -c1-40", True, base, g(SECRET_READS="Masked")),
+        ("invalid CODE_MODE acts as enforce", "python3 -c 'print(1)'", True, base, g(CODE_MODE="enforced")),
+        ("invalid env value acts as strictest", "kubectl scale deploy api --replicas=2", True,
+         dict(base, KIRO_GUARD_MODE="read-only"), None),
+        ("LOCAL_CONTEXTS from env ignored", "kubectl delete pod x", True, dict(base, KIRO_LOCAL_CONTEXTS="aks-.*"), None),
+    ]
+    for label, c, want, env, guard in conf_cases:
+        expect(c, want, env, "conf/" + label, guard=guard)
+    guard_py_of = lambda gsh: os.path.join(os.path.dirname(gsh), "kiro_guard.py")
+    for label, gsh, env, args, want_out, want_rc in [
+        ("conf-get default", GUARD, base, ["--conf-get", "RUN_SANDBOX"], "off", 0),
+        ("conf-get validated", g(RUN_SANDBOX="Auto"), base, ["--conf-get", "RUN_SANDBOX"], "auto", 0),
+        ("conf-get invalid -> strictest", g(RUN_ALLOW_ADMIN="yes"), base, ["--conf-get", "RUN_ALLOW_ADMIN"], "0", 0),
+        ("conf-get env cannot widen", GUARD, dict(base, KIRO_RUN_ALLOW_ADMIN="1"), ["--conf-get", "RUN_ALLOW_ADMIN"], "0", 0),
+        ("conf-get file widens", g(RUN_ALLOW_ADMIN="1"), base, ["--conf-get", "RUN_ALLOW_ADMIN"], "1", 0),
+        ("check-conf clean", GUARD, base, ["--check-conf"], "", 0),
+        ("check-conf invalid", g(SECRET_READS="masked"), base, ["--check-conf"], "FAIL", 1),
+        ("check-conf unknown key", g(GUARD_MODEE="off"), base, ["--check-conf"], "WARN\tunknown setting GUARD_MODEE", 0),
+        ("check-conf env ignored", GUARD, dict(base, KIRO_CODE_MODE="off"), ["--check-conf"], "KIRO_CODE_MODE=off ignored", 0),
+    ]:
+        p = subprocess.run([sys.executable, guard_py_of(gsh)] + args, capture_output=True, text=True, env=env, cwd=tmp)
+        if p.returncode != want_rc or (want_out not in p.stdout if want_out else p.stdout.strip()):
+            fails.append("conf/%s: expected rc=%s and %r, got rc=%s %r" % (label, want_rc, want_out, p.returncode, p.stdout[:160]))
     # fallback (no python3 on PATH)
     nopy = os.path.join(tmp, "nopy")
     os.makedirs(nopy)
@@ -1013,7 +1240,7 @@ def main():
         fails.append("malformed payload should block, rc=%s" % p.returncode)
 
     total = len(BLOCK) + len(ALLOW) + 3 * len(REDIRECT) + 3 * len(COMPOUND) + 2 * len(CLOUD_COMPOUND) + len(SINGLE) + 2 * len(PROGRAM_BLOCK) + \
-        len(PROGRAM_ALLOW) + len(CLOUD_USE) + 1 + 13 + 3 + 2 * len(MUTATING) + 4 + sum(2 if n.endswith('.sh') else 1 for n in SCRIPTS) + 4 + 4 + 1 + 16 + 2 + 3 + 1 + 9 + 1 + 2 * 12 + 17 + 8 + 3 * len(agent_names)
+        len(PROGRAM_ALLOW) + len(CLOUD_USE) + 1 + 13 + 3 + 2 * len(MUTATING) + 4 + sum(2 if n.endswith('.sh') else 1 for n in SCRIPTS) + 4 + 4 + 1 + 16 + 2 + 3 + 1 + 9 + 1 + 2 * 12 + 17 + 8 + 3 * len(agent_names) + len(conf_cases) + 9 + len(ws_writes) + len(link_checks) + len(log_checks) + len(tool_checks) + 3
     shutil.rmtree(tmp_home, ignore_errors=True)
     if fails:
         print("\n".join(fails))

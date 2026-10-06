@@ -11,9 +11,18 @@
 #   returns what it printed; with a longer --timeout give the shell tool call the same timeout.
 #   kiro-run --more ID N          part N of an earlier run's output (runs nothing)
 #
+# Background jobs, for work longer than one shell call (a long test suite, a terraform plan):
+#   kiro-run --bg [--timeout SEC] <<'EOF'   start the program detached (same checks; default 1800 s,
+#                                 at most 3600, at most 4 jobs at a time) and return its id at once
+#   kiro-run --wait ID [SEC]      wait up to SEC (60, at most 100) for the job; prints the output it
+#                                 printed since the last wait, masked; once it ended, its exit code
+#   kiro-run --stop ID            stop the job and everything it started
+#   kiro-run --jobs               list the jobs started from this folder
+#
 # One tool result holds about 28,000 characters: Kiro replaces anything of 30,000 or more with a short
 # preview and a file to read back. Longer output therefore comes in parts: the first part names the
-# `kiro-run --more` calls that fetch the others, and those can all be issued in one step.
+# `kiro-run --more` calls that fetch the others, and those can all be issued in one step. A program that
+# fails shows its start and its last 60 lines (where the error is) in one result, and its exit code.
 #
 # Python programs can `import kt` (survey, review, read, calls, tree, secrets, risky, files, grep,
 # outline, show, sh: repo helpers that keep output small and secrets out of it); bash programs have the
@@ -21,30 +30,56 @@
 # kt.survey) raises the line cap for that run, so reading a batch of files takes one run, not one per file.
 #
 # Safety: the program is saved under .kiro/scratch/ (excluded from git), inspected by kiro-guard
-# before this runs, executed with a timeout, and its output is capped (full output kept in scratch).
-# Secrets never stop a program: their values (from the environment, from the project's secrets files,
-# and anything that looks like a key or token) are replaced by [redacted] before the output is stored
-# or shown. A program that really runs a cloud CLI or SDK (kubectl, helm, az, aws, boto3 ...) is
-# refused unless read-only credentials for that cloud are active (KIRO_RUN_ALLOW_ADMIN=1 overrides —
-# set it yourself, in your shell, deliberately); folder names and local-only commands such as
-# `helm lint` or `helm template` do not count.
+# before this runs, syntax-checked (bash), executed with a timeout that ends everything it started,
+# and its output is capped (full output kept in scratch). Secrets never stop a program: their values
+# (from the environment, from the project's secrets files, and anything that looks like a key or token)
+# are replaced by [redacted] before the output is stored or shown; without python3 or the masking filter
+# nothing runs. A program that really runs a cloud CLI or SDK (kubectl, helm, az, aws, boto3 ...) is
+# refused unless read-only credentials for that cloud are active (RUN_ALLOW_ADMIN=1 in kiro-guard.conf
+# overrides; no environment variable does); folder names and local-only commands such as `helm lint` or
+# `helm template` do not count. RUN_SANDBOX in kiro-guard.conf runs programs in a bubblewrap sandbox.
+# Every run is recorded in .kiro/scratch/runs.jsonl and in the audit log (~/.kiro/kiro-guard.log), with
+# its arguments masked and none of its output.
+#
+# A program's output is kept up to 20 MB (a program that prints more is stopped), a failed run comes with
+# a hint when the error has a known cause outside the traceback, the same program run again and again on
+# an unchanged workspace is warned about at 3 runs in a row and refused at 6, and runs and finished jobs
+# older than 7 days are removed from .kiro/scratch (never .kiro/scratch/tools/, the saved tools).
+#
+# Exit codes of its own: 64 usage, 65 empty program or syntax error (nothing ran), 66 no such file, part
+# or job, 75 too many background jobs, 76 the same program again on an unchanged workspace, 77 cloud
+# command without read-only credentials, 78 no python3 or masking filter, 79 RUN_SANDBOX=require and the
+# sandbox cannot start, 124 timeout; otherwise the program's.
 set -u
-timeout_s=100; lines=250; raw=0; lang=""; file=""; args=(); more=0; more_id=""; more_n=2
+umask 077                    # programs, outputs and records in scratch are the user's alone
+timeout_s=100; timeout_given=0; lines=250; raw=0; lang=""; file=""; args=(); mode=run; more_id=""; more_n=2; job_id=""; wait_s=60
+bwrap_paths="/usr/bin/bwrap /bin/bwrap"     # the sandbox binary is never taken from PATH
+cap_mb=20                                   # output kept per run (and per background job)
+case "${KIRO_RUN_CAP_MB:-}" in ''|*[!0-9]*) ;; *) [ "$KIRO_RUN_CAP_MB" -ge 1 ] && [ "$KIRO_RUN_CAP_MB" -lt "$cap_mb" ] && cap_mb="$KIRO_RUN_CAP_MB" ;; esac
+cap_bytes=$((cap_mb * 1024 * 1024))         # (the environment can only lower it)
 while [ $# -gt 0 ]; do
   case "$1" in
-    --more) more=1; more_id="${2:-}"; more_n="${3:-2}"; break ;;
+    --more) mode=more; more_id="${2:-}"; more_n="${3:-2}"; break ;;
+    --wait) mode=wait; job_id="${2:-}"; wait_s="${3:-60}"; break ;;
+    --stop) mode=stop; job_id="${2:-}"; break ;;
+    --jobs) mode=jobs; break ;;
+    --bg) mode=bg; shift ;;
     --bash) lang=bash; shift ;;
     --python|--py) lang=python; shift ;;
-    --timeout) timeout_s="${2:-}"; shift 2 ;;
-    --lines) lines="${2:-}"; shift 2 ;;
+    --timeout) timeout_s="${2:-}"; timeout_given=1; shift; [ $# -gt 0 ] && shift ;;
+    --lines) lines="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --raw) raw=1; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     --) shift; if [ $# -gt 0 ]; then file="$1"; shift; args=("$@"); fi; break ;;
     -*) echo "kiro-run: unknown option $1 (options go before the program file)" >&2; exit 64 ;;
     *) file="$1"; shift; args=("$@"); break ;;
   esac
 done
 case "$timeout_s$lines" in *[!0-9]*|"") echo "kiro-run: --timeout and --lines take a number" >&2; exit 64 ;; esac
+if [ "$mode" = bg ]; then
+  [ "$timeout_given" = 1 ] || timeout_s=1800
+  [ "$timeout_s" -le 3600 ] || { echo "kiro-run: a background job runs at most 3600 s (--timeout 3600)" >&2; exit 64; }
+fi
 chars="${KIRO_RUN_CHARS:-28000}"; case "$chars" in *[!0-9]*|"") chars=28000 ;; esac
 # Colour is for the person watching: Kiro shows the colour codes of tool output as they are. The agent
 # reads them too, so there are few: white on red = stopped (refused, timed out), pink + cyan = the banner
@@ -53,9 +88,10 @@ chars="${KIRO_RUN_CHARS:-28000}"; case "$chars" in *[!0-9]*|"") chars=28000 ;; e
 color=1; [ -n "${NO_COLOR+x}" ] && color=0
 alert() { if [ "$color" = 1 ]; then printf '\033[1;97;41m %s \033[0m' "$1"; else printf '%s' "$1"; fi; }
 now_ms() { local t="${EPOCHREALTIME:-}"; if [ -n "$t" ]; then t="${t/[.,]/}"; echo "$((t / 1000))"; else echo "$((SECONDS * 1000))"; fi; }
+t0="$(now_ms)"
 
 # --- a later part of an earlier run's output: nothing runs --------------------------------------
-if [ "$more" = 1 ]; then
+if [ "$mode" = more ]; then
   case "$more_id" in *[!0-9-]*|"") echo "kiro-run: --more takes the run id and the part number named in part 1 (kiro-run --more ID N)" >&2; exit 64 ;; esac
   case "$more_n" in *[!0-9]*|"") echo "kiro-run: --more takes the run id and the part number named in part 1 (kiro-run --more ID N)" >&2; exit 64 ;; esac
   part="$PWD/.kiro/scratch/run-$more_id.part$more_n"
@@ -66,19 +102,68 @@ if [ "$more" = 1 ]; then
   exit 66
 fi
 
-lib="${KIRO_LIB:-$HOME/.kiro/lib}"
-[ -f "$lib/kt.py" ] || lib="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/../global/lib"
+# --- the pack: next to this file in a checkout of it, otherwise as installed under ~/.kiro ----------
+# No environment variable chooses these: a masking filter or a guard swapped in by a variable would
+# turn the checks off.
+self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+selfdir="$(cd "$(dirname "$self")" 2>/dev/null && pwd)"
+if [ "$(basename "$selfdir")" = safety ] && [ -f "$selfdir/../global/lib/kt.py" ]; then
+  pack="$(cd "$selfdir/.." && pwd)"; lib="$pack/global/lib"; guard_py="$pack/global/hooks/scripts/kiro_guard.py"
+else
+  lib="$HOME/.kiro/lib"; guard_py="$HOME/.kiro/hooks/scripts/kiro_guard.py"
+fi
 export PYTHONPATH="$lib${PYTHONPATH:+:$PYTHONPATH}"
 [ -f "$lib/kt.bash" ] && export BASH_ENV="$lib/kt.bash"       # kt commands inside bash programs
+log_file="$HOME/.kiro/kiro-guard.log"
+
+# Without python3 or the masking filter, nothing a program printed could be masked: run nothing.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "$(alert 'kiro-run: refused') — python3 not found, so the output could not be masked; nothing was run." >&2; exit 78
+fi
+if [ ! -f "$lib/kiro_redact.py" ]; then
+  echo "$(alert 'kiro-run: refused') — the masking filter is missing ($lib/kiro_redact.py; re-run install.sh); nothing was run." >&2; exit 78
+fi
 
 scratch="$PWD/.kiro/scratch"; mkdir -p "$scratch"
 find "$scratch" -maxdepth 1 -type f -name 'run-*.part*' -mmin +1440 -delete 2>/dev/null   # parts of old runs
+# runs older than 7 days (programs, outputs, snapshots); .kiro/scratch/tools/ is never touched
+find "$scratch" -maxdepth 1 -type f -name 'run-*' -mmin +10080 -delete 2>/dev/null
 if git rev-parse --git-dir >/dev/null 2>&1; then
   ex="$(git rev-parse --git-dir)/info/exclude"; grep -qx '.kiro/scratch/' "$ex" 2>/dev/null || echo '.kiro/scratch/' >> "$ex"
 fi
+jobs_dir="$scratch/jobs"
+if [ -d "$jobs_dir" ] && [ -n "$(find "$jobs_dir" -maxdepth 1 -type f -mmin +10080 -print -quit 2>/dev/null)" ]; then
+  python3 -I "$lib/kiro_jobs.py" prune "$jobs_dir" 7 >/dev/null 2>&1          # finished jobs older than 7 days
+fi
+
+# --- background jobs: read their state, stop them (nothing new runs) ------------------------------
+case "$mode" in
+  jobs) python3 -I "$lib/kiro_jobs.py" list "$jobs_dir"; exit $? ;;
+  wait|stop)
+    case "$job_id" in *[!0-9-]*|"") echo "kiro-run: --$mode takes the job id that --bg printed (kiro-run --jobs lists them)" >&2; exit 64 ;; esac
+    if [ "$mode" = stop ]; then python3 -I "$lib/kiro_jobs.py" stop "$jobs_dir" "$job_id"; exit $?; fi
+    case "$wait_s" in *[!0-9]*|"") wait_s=60 ;; esac; [ "$wait_s" -gt 100 ] && wait_s=100
+    python3 -I "$lib/kiro_jobs.py" wait "$jobs_dir" "$job_id" "$wait_s" "$((chars - 1000))"; exit $? ;;
+esac
+
+# --- every run leaves a record, whatever path it takes out of here ---------------------------------
 stamp="$(date +%Y%m%d-%H%M%S)-$$"
+prog=""; outcome=""; action=""; reason=""; sandbox_used=off; total=""; parts=""; masked_n=""; snap=""; rep_note=""
+finish() {
+  local rc=$? ms
+  [ -n "$snap" ] && rm -f "$snap" "$snap.t"
+  [ -n "$outcome" ] && [ -f "$lib/kiro_runlog.py" ] || return 0
+  ms=$(( $(now_ms) - t0 ))
+  # in the background: the record (git, masking of the arguments) must not hold up the result
+  ( KR_SCRATCH="$scratch" KR_ID="$stamp" KR_MODE="$mode" KR_LANG="$lang" KR_PROG="$prog" KR_OUTCOME="$outcome" \
+    KR_RC="$rc" KR_MS="$ms" KR_TIMEOUT="$timeout_s" KR_LINES="$total" KR_PARTS="$parts" KR_MASKED="$masked_n" \
+    KR_SANDBOX="$sandbox_used" KR_ACTION="$action" KR_LOG="$log_file" KR_REASON="$reason" \
+    python3 -I "$lib/kiro_runlog.py" record ${args[@]+"${args[@]}"} ) >/dev/null 2>&1 </dev/null &
+}
+trap finish EXIT
+
 if [ -n "$file" ]; then
-  [ -f "$file" ] || { echo "kiro-run: no such file: $file" >&2; exit 66; }
+  [ -f "$file" ] || { outcome=usage; echo "kiro-run: no such file: $file" >&2; exit 66; }
   [ -z "$lang" ] && case "$file" in *.sh|*.bash) lang=bash ;; *) lang=python ;; esac
   prog="$file"
 else
@@ -87,20 +172,87 @@ else
   ext=py; [ "$lang" = bash ] && ext=sh
   prog="$scratch/run-$stamp.$ext"; cat > "$prog"
 fi
-[ -s "$prog" ] || { echo "kiro-run: empty program" >&2; exit 65; }
+[ -s "$prog" ] || { outcome=usage; echo "kiro-run: empty program" >&2; exit 65; }
 
-# --- cloud-credential check -------------------------------------------------------------------
-# What the program really runs or imports decides (kiro-guard's parser tells): a folder called helm/
-# or the word aws in a search pattern is not use. Without that parser, fall back to a plain word search.
-guard_py="${KIRO_GUARD_PY:-$HOME/.kiro/hooks/scripts/kiro_guard.py}"
-[ -f "$guard_py" ] || guard_py="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/../global/hooks/scripts/kiro_guard.py"
+# --- a bash program with a syntax error runs nothing (bash would run the lines before the error) ----
+if [ "$lang" = bash ]; then
+  if ! err="$(env -u BASH_ENV bash -n "$prog" 2>&1)"; then
+    outcome=syntax; action=SYNTAX; reason="syntax error"
+    echo "$(alert 'kiro-run: syntax error') — nothing was executed. Fix the program and run it again:" >&2
+    printf '%s\n' "$err" | sed "s|$prog|program|g" | head -n 20 >&2
+    exit 65
+  fi
+fi
+
+# --- the same program again and again on an unchanged workspace adds nothing: a warning at 3 runs in a
+# row, a refusal at 6. The workspace is git's view of it (status, and the size and time of every changed
+# file), or outside git the files of this folder; any other program, or any change, starts the count anew.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  snap="$scratch/run-$stamp.snap"; git status --porcelain=v1 -z > "$snap" 2>/dev/null || snap=""
+fi
+ws=()                                   # the changed files (git), or this folder's files (no git)
+if [ -n "$snap" ]; then
+  while IFS= read -r -d '' e && [ ${#ws[@]} -lt 200 ]; do ws+=("${e:3}"); done < "$snap"
+else
+  ws=(* .[!.]*); ws=("${ws[@]:0:500}")
+fi
+fp="$( { printf '%s\0' "$mode" "$timeout_s" "$lang" ${args[@]+"${args[@]}"}; printf '\1%s\1' "$(<"$prog")"
+         [ -n "$snap" ] && printf '%s' "$(tr '\0' '\n' < "$snap")"
+         [ ${#ws[@]} -gt 0 ] && stat -c '%n %s %y' -- "${ws[@]}" 2>/dev/null; } | sha256sum)"; fp="${fp%% *}"
+rep=1; last_fp=""; last_n=0
+[ -f "$scratch/.repeat" ] && read -r last_fp last_n < "$scratch/.repeat"
+case "$last_n" in ''|*[!0-9]*) last_n=0 ;; esac
+[ -n "$fp" ] && [ "$last_fp" = "$fp" ] && rep=$((last_n + 1))
+printf '%s %s\n' "$fp" "$rep" > "$scratch/.repeat" 2>/dev/null
+if [ "$rep" -ge 6 ]; then
+  outcome=repeat; action=REFUSED; reason="the same program for the ${rep}th time in a row on an unchanged workspace"
+  echo "$(alert 'kiro-run: refused') — this exact program has now run $rep times in a row on an unchanged workspace. Re-running identical code adds no information: summarize what you know and finish, or change the program materially. Nothing was run." >&2
+  exit 76
+elif [ "$rep" -ge 3 ]; then
+  rep_note="[kiro-run: this exact program has now run $rep times in a row on an unchanged workspace; at 6 it will be refused. Change the approach or report what you know.]"
+fi
+
+# --- settings and the cloud check, both from kiro-guard (one process: its settings are validated, and
+# the environment can only tighten them). What the program really runs or imports decides the cloud
+# check: a folder called helm/ or the word aws in a search pattern is not use. Without the guard's
+# module, its command line answers; without the guard at all, a plain word search does.
 kind=code; [ "$lang" = bash ] && kind=shell
-detect() { python3 "$guard_py" --cloud-use "$1" 2>/dev/null; }
-need=""; seen=""
-if command -v python3 >/dev/null 2>&1 && [ -f "$guard_py" ] && found="$(detect "$kind" < "$prog")"; then
-  if [ ${#args[@]} -gt 0 ]; then found="$found
+allow_admin=0; sb_mode=off; sb_net=deny; need=""; seen=""; found=""; conf=""
+if [ -f "$guard_py" ]; then
+  probe="$(python3 -I - "$(dirname "$guard_py")" "$kind" "$prog" ${args[@]+"${args[@]}"} 2>/dev/null <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+kind, prog, args = sys.argv[2], sys.argv[3], sys.argv[4:]
+sys.argv = sys.argv[:1]
+import kiro_guard as g
+c = g.CONF
+print("conf\t%s\t%s\t%s\t%s" % (c["RUN_ALLOW_ADMIN"], c["RUN_SANDBOX"], c["RUN_SANDBOX_NET"], c["LOG_FILE"]))
+with open(prog, encoding="utf-8", errors="replace") as fh:
+    use = [g.cloud_use(fh.read(), kind, os.getcwd())]
+if args:
+    use.append(g.cloud_use(" ".join(args) + "\n", "shell", os.getcwd()))
+for u in use:
+    for cloud, ev in sorted(u.items()):
+        print("cloud\t%s\t%s" % (cloud, ev.replace("\n", " ")))
+PY
+)"
+  if conf="$(printf '%s\n' "$probe" | sed -n 's/^conf	//p')" && [ -n "$conf" ]; then
+    found="$(printf '%s\n' "$probe" | sed -n 's/^cloud	//p')"
+  else
+    conf="$(for k in RUN_ALLOW_ADMIN RUN_SANDBOX RUN_SANDBOX_NET LOG_FILE; do python3 "$guard_py" --conf-get "$k" 2>/dev/null || echo -; done | paste -sd'	' -)"
+    detect() { python3 "$guard_py" --cloud-use "$1" 2>/dev/null; }
+    found="$(detect "$kind" < "$prog")" || conf=""
+    if [ ${#args[@]} -gt 0 ]; then found="$found
 $(printf '%s\n' "${args[*]}" | detect shell)"; fi
-  need="$(printf '%s\n' "$found" | cut -f1 | sort -u | tr '\n' ' ')"
+  fi
+  IFS='	' read -r c_admin c_sb c_net c_log <<< "$conf"
+  [ "${c_admin:-}" = 1 ] && allow_admin=1
+  case "${c_sb:-}" in auto|require) sb_mode="$c_sb" ;; esac
+  [ "${c_net:-}" = allow ] && sb_net=allow
+  case "${c_log:-}" in /*) log_file="$c_log" ;; esac
+fi
+if [ -n "$conf" ]; then
+  need="$(printf '%s\n' "$found" | cut -f1 | sed '/^$/d' | sort -u | tr '\n' ' ')"
   seen="$(printf '%s\n' "$found" | sed -n 's/^[a-z0-9]*	//p' | head -n 3 | paste -sd'|' - | sed 's/|/; /g')"
 else
   uses() { { cat "$prog"; printf '\n%s\n' "${args[*]-}"; } | grep -qE "$1"; }
@@ -108,32 +260,128 @@ else
   uses '(\baz\b|azure\.|AzureCli|DefaultAzureCredential|management\.azure\.com)' && need="$need azure"
   uses '(\baws\b|boto3|botocore|amazonaws\.com)' && need="$need aws"
 fi
-missing=""
-if [ "${KIRO_RUN_ALLOW_ADMIN:-0}" != 1 ]; then
-  case "$need" in *k8s*)   case "${KUBECONFIG:-}" in *kiro-readonly*) ;; *) missing="$missing k8s";; esac ;; esac
-  case "$need" in *azure*) case "${AZURE_CONFIG_DIR:-}" in *kiro*) ;; *) missing="$missing azure";; esac ;; esac
-  case "$need" in *aws*)   case "${AWS_CONFIG_FILE:-}" in *kiro*) ;; *) missing="$missing aws";; esac ;; esac
-fi
+missing=""; creds=()
+case "$need" in *k8s*)   case "${KUBECONFIG:-}" in *kiro-readonly*) IFS=: read -ra kc <<< "$KUBECONFIG"; creds+=("${kc[@]}") ;; *) missing="$missing k8s";; esac ;; esac
+case "$need" in *azure*) case "${AZURE_CONFIG_DIR:-}" in *kiro*) creds+=("$AZURE_CONFIG_DIR") ;; *) missing="$missing azure";; esac ;; esac
+case "$need" in *aws*)   case "${AWS_CONFIG_FILE:-}" in *kiro*) creds+=("$(dirname "$AWS_CONFIG_FILE")" "$HOME/.aws/sso/cache") ;; *) missing="$missing aws";; esac ;; esac
+[ "$allow_admin" = 1 ] && missing=""
 if [ -n "$missing" ]; then
+  outcome=refused; action=REFUSED; reason="cloud command without read-only credentials:$missing"
   echo "$(alert 'kiro-run: refused') — this program runs a cluster/cloud command${seen:+ ($seen)} and read-only credentials are not active for:${missing}." >&2
   echo "kiro-run: only that command is the problem. Take it out and run the rest of the program again (reading and analysing local files needs no credentials), and issue the cluster/cloud command alone as a direct call so the user is asked." >&2
-  echo "kiro-run: programs that query clusters or accounts work once the user starts Kiro with 'kiro-safe' (or sets KIRO_RUN_ALLOW_ADMIN=1 in their own shell). Program kept at $prog." >&2
+  echo "kiro-run: programs that query clusters or accounts work once the user starts Kiro with 'kiro-safe' (or sets RUN_ALLOW_ADMIN=1 in kiro-guard.conf). Program kept at $prog." >&2
   exit 77
 fi
 
-# --- run with limits; secrets are redacted before the output is stored or shown -----------------
-redact() {
-  if [ -f "$lib/kiro_redact.py" ] && command -v python3 >/dev/null 2>&1; then python3 "$lib/kiro_redact.py"; else cat; fi
-}
-out="$scratch/run-$stamp.out"
-export KIRO_RUN_CAPFILE="$scratch/run-$stamp.cap"; rm -f "$KIRO_RUN_CAPFILE"
-t0="$(now_ms)"
-if [ "$lang" = bash ]; then
-  timeout -k 5 "$timeout_s" bash -o pipefail "$prog" ${args[@]+"${args[@]}"} 2>&1 | redact > "$out"; rc=${PIPESTATUS[0]}
-else
-  PYTHONUNBUFFERED=1 timeout -k 5 "$timeout_s" python3 "$prog" ${args[@]+"${args[@]}"} 2>&1 | redact > "$out"; rc=${PIPESTATUS[0]}
+# --- the sandbox (RUN_SANDBOX=auto|require): bubblewrap, Linux only ---------------------------------
+interp=(python3); [ "$lang" = bash ] && interp=(bash -o pipefail)
+run_cmd=("${interp[@]}" "$prog" ${args[@]+"${args[@]}"})
+bpf=""; sb_note=""
+if [ "$sb_mode" != off ]; then
+  bwrap=""; why=""
+  for b in $bwrap_paths; do [ -x "$b" ] && { bwrap="$b"; break; }; done
+  net="$sb_net"; [ -n "${need// /}" ] && net=allow    # cloud commands passed the read-only check above
+  if [ "$(uname -s)" != Linux ]; then why="the sandbox needs Linux"
+  elif [ -z "$bwrap" ]; then why="bubblewrap is not installed (${bwrap_paths// / or })"
+  elif [ "$net" = deny ] && ! { bpf="$scratch/.seccomp-$(uname -m).bpf"; [ -s "$bpf" ] || python3 -I "$lib/kiro_sandbox.py" bpf > "$bpf"; }; then
+    why="no seccomp filter for $(uname -m)"; rm -f "$bpf"; bpf=""
+  elif ! "$bwrap" --ro-bind / / --unshare-all --die-with-parent --new-session --proc /proc --dev /dev \
+         ${bpf:+--seccomp 9} -- /bin/true 9<"${bpf:-/dev/null}" >/dev/null 2>&1; then
+    why="bubblewrap cannot start here (user namespaces disabled?)"
+  fi
+  if [ -z "$why" ]; then
+    root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    sb_args=(); while IFS= read -r -d '' a; do sb_args+=("$a"); done < <(python3 -I "$lib/kiro_sandbox.py" args \
+      "$root" "$scratch" "$net" "$prog" "$lib" ${creds[@]+"${creds[@]}"})
+    [ ${#sb_args[@]} -gt 0 ] || why="could not build the sandbox arguments"
+  fi
+  # the full set of mounts has to work too (a mount point bubblewrap cannot create stops every program)
+  if [ -z "$why" ] && ! sb_err="$("$bwrap" "${sb_args[@]}" ${bpf:+--seccomp 9} -- /bin/true 9<"${bpf:-/dev/null}" 2>&1 >/dev/null)"; then
+    why="bubblewrap cannot set up the mounts for this project (${sb_err%%$'\n'*})"
+  fi
+  if [ -n "$why" ] && [ "$sb_mode" = require ]; then
+    outcome=refused; action=REFUSED; reason="sandbox unavailable: $why"
+    echo "$(alert 'kiro-run: refused') — RUN_SANDBOX=require and $why; nothing was run. The user can install bubblewrap or change RUN_SANDBOX in kiro-guard.conf." >&2
+    exit 79
+  elif [ -n "$why" ]; then
+    sb_note="[kiro-run: ran without the sandbox: $why]"; bpf=""
+  else
+    sandbox_used="$net"
+    run_cmd=("$bwrap" "${sb_args[@]}" ${bpf:+--seccomp 9} -- "${run_cmd[@]}")
+  fi
 fi
-printf '%s\tRUN\tkiro-run\trc=%s\t%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$rc" "$prog${args[*]+ ${args[*]}}" >> "$HOME/.kiro/kiro-guard.log" 2>/dev/null
+[ -n "$bpf" ] && exec 9<"$bpf"
+
+# --- a background job: started detached, returns at once -------------------------------------------
+if [ "$mode" = bg ]; then
+  mkdir -p "$jobs_dir"
+  n="$(python3 -I "$lib/kiro_jobs.py" running "$jobs_dir" 2>/dev/null || echo 0)"
+  if [ "${n:-0}" -ge 4 ]; then
+    outcome=refused; action=REFUSED; reason="4 jobs running"
+    echo "$(alert 'kiro-run: refused') — 4 background jobs are running already: wait for one (kiro-run --wait ID) or stop one (kiro-run --stop ID); kiro-run --jobs lists them." >&2
+    exit 75
+  fi
+  # the job's session: the program under `timeout`, and a watch that stops it once its output passes the cap
+  KR_RC="$jobs_dir/$stamp.rc" KR_RAW="$jobs_dir/$stamp.raw" KR_CAP="$cap_bytes" PYTHONUNBUFFERED=1 setsid bash -c '
+    "$@" & p=$!
+    ( while kill -0 "$p" 2>/dev/null; do
+        sleep 2
+        [ "$(wc -c < "$KR_RAW" 2>/dev/null || echo 0)" -gt "$KR_CAP" ] || continue
+        echo "$KR_CAP" > "${KR_RC%.rc}.cut"; kill -TERM -- -"$p" 2>/dev/null; sleep 1; kill -KILL -- -"$p" 2>/dev/null; break
+      done ) >/dev/null 2>&1 </dev/null &
+    w=$!; wait "$p"; rc=$?; kill "$w" 2>/dev/null
+    printf "%s\n" "$rc" > "$KR_RC.tmp" && mv "$KR_RC.tmp" "$KR_RC"' \
+    kiro-job timeout -k 5 "$timeout_s" "${run_cmd[@]}" > "$jobs_dir/$stamp.raw" 2>&1 < /dev/null &
+  python3 -I "$lib/kiro_jobs.py" register "$jobs_dir" "$stamp" "$!" "$timeout_s" "$lang" "$prog" "$cap_bytes"
+  outcome=started; action=RUN
+  [ -n "$sb_note" ] && echo "$sb_note" >&2
+  [ -n "$rep_note" ] && echo "$rep_note" >&2
+  echo "[kiro-run: job $stamp started in the background (at most ${timeout_s}s). Do other work, then fetch its output: kiro-run --wait $stamp]"
+  exit 0
+fi
+
+# --- run with limits; the output goes to a file first, so a process the program leaves behind cannot
+# hold the result back; secrets are masked before the output is stored or shown ---------------------
+rawf="$scratch/run-$stamp.raw"; out="$scratch/run-$stamp.out"
+[ -n "$snap" ] && printf "%s\n" "${EPOCHREALTIME:-$(date +%s.%N)}" | tr , . > "$snap.t"
+export KIRO_RUN_CAPFILE="$scratch/run-$stamp.cap"; rm -f "$KIRO_RUN_CAPFILE"
+PYTHONUNBUFFERED=1 timeout -k 5 "$timeout_s" "${run_cmd[@]}" > "$rawf" 2>&1 <&0 &
+tpid=$!
+# a runaway print loop: once the output passes the cap the program is stopped (checked twice a second)
+( while kill -0 "$tpid" 2>/dev/null; do
+    sleep 0.5
+    [ "$(wc -c < "$rawf" 2>/dev/null || echo 0)" -gt "$cap_bytes" ] || continue
+    : > "$rawf.cut"; kill -TERM -- -"$tpid" 2>/dev/null; sleep 0.3; kill -KILL -- -"$tpid" 2>/dev/null; break
+  done ) >/dev/null 2>&1 </dev/null &
+wpid=$!
+wait "$tpid"; rc=$?
+kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+# `timeout` leads the program's process group: whatever is left in it was started by the program and
+# would outlive the run. So would a process that left the group but still writes into the output file.
+left=0
+if kill -0 -- -"$tpid" 2>/dev/null; then
+  left=$(pgrep -g "$tpid" 2>/dev/null | wc -l | tr -d ' '); [ "${left:-0}" -gt 0 ] || left=1
+  kill -TERM -- -"$tpid" 2>/dev/null; sleep 0.2; kill -KILL -- -"$tpid" 2>/dev/null
+fi
+if [ -d /proc/self/fd ]; then
+  holders="$(find /proc/[0-9]*/fd -maxdepth 1 -lname "$rawf" 2>/dev/null | cut -d/ -f3 | sort -u)"
+  if [ -n "$holders" ]; then
+    left=$((left + $(printf '%s\n' "$holders" | wc -l)))
+    kill -TERM $holders 2>/dev/null; sleep 0.2; kill -KILL $holders 2>/dev/null
+  fi
+fi
+{ exec 9<&-; } 2>/dev/null
+cut_note=""
+if [ -f "$rawf.cut" ] || [ "$(wc -c < "$rawf" 2>/dev/null || echo 0)" -gt "$cap_bytes" ]; then
+  cut_note="[kiro-run: output cut at ${cap_mb} MB$([ -f "$rawf.cut" ] && echo '; the program was stopped'): print findings, not raw data]"
+  truncate -s "$cap_bytes" "$rawf" 2>/dev/null || python3 -c 'import os, sys; os.truncate(sys.argv[1], int(sys.argv[2]))' "$rawf" "$cap_bytes"
+  rm -f "$rawf.cut"
+fi
+if ! python3 "$lib/kiro_redact.py" < "$rawf" > "$out" 2>/dev/null; then
+  echo "[kiro-run: the masking filter failed, so the output is withheld]" > "$out"
+fi
+rm -f "$rawf"
+outcome=ok; [ "$rc" -ne 0 ] && outcome=failed; [ "$rc" -eq 124 ] && outcome=timed_out; action=RUN
 
 # kt.read asked for room: a deliberate read of N lines is shown whole (up to 3000 lines)
 if [ -f "$KIRO_RUN_CAPFILE" ]; then
@@ -141,30 +389,56 @@ if [ -f "$KIRO_RUN_CAPFILE" ]; then
   if [ -n "$want" ]; then want=$((want + 400)); [ "$want" -gt 3000 ] && want=3000; [ "$want" -gt "$lines" ] && lines="$want"; fi
 fi
 total=$(wc -l < "$out" | tr -d ' ')
-show="$out"
-if [ "$raw" != 1 ] && [ "$total" -gt "$lines" ]; then
-  show="$scratch/run-$stamp.shown"
-  { head -n "$lines" "$out"
-    echo "... [kiro-run: $((total - lines)) more lines not shown (cap: $lines). To read files use kt.read, which is shown whole; otherwise print less or re-run with --lines N. Full output: $out]"; } > "$show"
+masked_n="$(sed -n '$s/^\[kiro-run: \([0-9][0-9]*\) secret values\{0,1\} masked.*/\1/p' "$out")"
+notes=""
+[ "$left" -gt 0 ] && notes="[kiro-run: stopped $left process$([ "$left" -gt 1 ] && echo es) the program left running]"
+for n_ in "$cut_note" "$sb_note" "$rep_note"; do
+  [ -n "$n_" ] && notes="${notes:+$notes
+}$n_"
+done
+show="$scratch/run-$stamp.shown"
+if [ "$raw" = 1 ]; then
+  show="$out"
+elif [ "$rc" -ne 0 ]; then
+  # a failed run: its start, its last lines (the error) and the exit code, in one result
+  extra="$notes"
+  if [ -n "$snap" ]; then
+    changed="$(python3 -I "$lib/kiro_runlog.py" changed "$snap" "$(cat "$snap.t" 2>/dev/null)" 2>/dev/null)"
+    [ -n "$changed" ] && extra="${extra:+$extra
+}[kiro-run: changed before it failed: $changed — inspect before running it again]"
+  fi
+  hints="$(python3 -I "$lib/kiro_hint.py" "$out" "$rc" "$sandbox_used" 2>/dev/null)"
+  [ -n "$hints" ] && extra="${extra:+$extra
+}$hints"
+  python3 "$lib/kiro_page.py" fail "$out" "$lines" "$((chars - 400))" "$rc" "$out" "$extra" > "$show" 2>/dev/null || cp "$out" "$show"
+else
+  if [ "$total" -gt "$lines" ]; then
+    { head -n "$lines" "$out"
+      echo "... [kiro-run: $((total - lines)) more lines not shown (cap: $lines). To read files use kt.read, which is shown whole; the rest of this output is in $out: read it with kt.show or grep rather than running the program again]"; } > "$show"
+  else
+    cp "$out" "$show"
+  fi
+  [ -n "$notes" ] && printf '%s\n' "$notes" >> "$show"
 fi
 # the banner: one line that marks the result as a code-mode program and says how long it took
 if [ "$color" = 1 ] && [ "$raw" != 1 ]; then
   ms=$(( $(now_ms) - t0 )); [ "$ms" -lt 0 ] && ms=0
   if [ "$ms" -lt 1000 ]; then took="${ms}ms"; else took="$((ms / 1000)).$((ms % 1000 / 100))s"; fi
-  printf '\033[1;38;5;212m◆ code mode\033[0;38;5;87m %s · %s\033[0m' "$lang" "$took"
-  masked="$(sed -n '$s/^\[kiro-run: \([0-9][0-9]* secret values\{0,1\}\) masked.*/\1/p' "$out")"
-  [ -n "$masked" ] && printf ' \033[38;5;221m· %s masked\033[0m' "$masked"
+  printf '\033[1;38;5;212m◆ code mode\033[0;38;5;87m %s · %s' "$lang" "$took"
+  [ "$sandbox_used" != off ] && printf ' · sandbox'
+  printf '\033[0m'
+  [ -n "$masked_n" ] && printf ' \033[38;5;221m· %s secret value%s masked\033[0m' "$masked_n" "$([ "$masked_n" = 1 ] || echo s)"
   printf '\n'
 fi
 # what is shown never exceeds one tool result: the rest is saved as parts for `kiro-run --more`
-if [ "$raw" = 1 ]; then
+if [ "$raw" = 1 ] || [ "$rc" -ne 0 ]; then
   cat "$show"
-elif command -v python3 >/dev/null 2>&1 && [ -f "$lib/kiro_page.py" ]; then
+elif [ -f "$lib/kiro_page.py" ]; then
   python3 "$lib/kiro_page.py" first "$show" "$chars" "$scratch/run-$stamp" "$stamp" || cat "$show"
 else
   head -c "$chars" "$show"
-  [ "$(wc -c < "$show" | tr -d ' ')" -gt "$chars" ] && printf '\n... [kiro-run: output cut at %s characters. Full output: %s]\n' "$chars" "$out"
 fi
+parts="$(ls "$scratch/run-$stamp".part* 2>/dev/null | wc -l | tr -d ' ')"; [ "$parts" -gt 0 ] && parts=$((parts + 1)) || parts=1
 [ "$show" != "$out" ] && rm -f "$show"
 [ "$rc" -eq 124 ] && echo "$(alert "kiro-run: killed after ${timeout_s}s timeout")" >&2
 exit "$rc"
